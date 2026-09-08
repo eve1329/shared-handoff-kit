@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shared Handoff Kit"
+  short_description: "Autonomously activate shared handoff and compact recovery"
+  default_prompt: "Use $shared-handoff-kit to automatically activate the shared task-local handoff runtime in the current workspace. Run the bundled activation and report the result; do not give me shell commands to run."

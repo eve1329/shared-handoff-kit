@@ -1,0 +1,67 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON_COMMAND__ __CODEX_HOME__/hooks/context_handoff.py",
+            "timeout": 10,
+            "statusMessage": "Checking context handoff state"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON_COMMAND__ __CODEX_HOME__/hooks/context_handoff.py",
+            "timeout": 10,
+            "statusMessage": "Checking continuation context"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON_COMMAND__ __CODEX_HOME__/hooks/context_handoff.py",
+            "timeout": 20,
+            "statusMessage": "Saving context snapshot before compact"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON_COMMAND__ __CODEX_HOME__/hooks/context_handoff.py",
+            "timeout": 20,
+            "statusMessage": "Recording compact completion"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__PYTHON_COMMAND__ __CODEX_HOME__/hooks/context_handoff.py",
+            "timeout": 10,
+            "statusMessage": "Updating context handoff snapshot"
+          }
+        ]
+      }
+    ]
+  }
+}
