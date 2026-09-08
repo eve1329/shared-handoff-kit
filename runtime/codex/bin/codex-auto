@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+GUARD_REL = ".agents/state/context_guard.json"
+PROCESS_REL = ".agents/state/process.md"
+AUTO_REL = ".agents/state/process.auto.md"
+RECENT_REL = ".agents/state/process.recent.md"
+RESUME_REL = ".agents/state/codex-auto-resume.md"
+STATE_REL = ".agents/state"
+TASKS_REL = ".agents/state/tasks"
+CURRENT_TASK_REL = ".agents/state/current-task"
+DEFAULT_TASK_ID = "main"
+
+KNOWN_SUBCOMMANDS = {
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "mcp-server",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "resume",
+    "archive",
+    "unarchive",
+    "fork",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
+}
+
+OPTIONS_WITH_VALUE = {
+    "-c",
+    "--config",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-C",
+    "--cd",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
+    "--remote",
+    "--remote-auth-token-env",
+    "--download-url",
+    "--local-provider",
+}
+
+OPTIONS_WITH_VALUE_PREFIXES = tuple(f"{option}=" for option in OPTIONS_WITH_VALUE if option.startswith("--"))
+
+RESUME_FLAGS = {"--last", "--all", "--include-non-interactive"}
+WRAPPER_DIR = pathlib.Path(__file__).resolve().parent
+WRAPPER_NAMES = {"codex", "codex-auto", "codex.cmd", "codex-auto.cmd", "codex-auto.py"}
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def now() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def stamp() -> str:
+    return _dt.datetime.now().astimezone().strftime("%Y%m%dT%H%M%S%z")
+
+
+def parse_wrapper_args(argv: list[str]) -> tuple[dict[str, Any], list[str]]:
+    options: dict[str, Any] = {
+        "dry_run": False,
+        "no_exec": False,
+        "json": False,
+        "codex_bin": os.environ.get("CODEX_REAL_BIN") or resolve_codex_bin(),
+        "task_id": normalize_task_id(os.environ.get("CODEX_TASK_ID", "")),
+    }
+    codex_args: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            codex_args.extend(argv[i + 1 :])
+            break
+        if arg == "--auto-dry-run":
+            options["dry_run"] = True
+            i += 1
+            continue
+        if arg == "--auto-no-exec":
+            options["no_exec"] = True
+            i += 1
+            continue
+        if arg == "--auto-json":
+            options["json"] = True
+            i += 1
+            continue
+        if arg == "--auto-codex-bin":
+            if i + 1 >= len(argv):
+                raise SystemExit("--auto-codex-bin requires a value")
+            options["codex_bin"] = argv[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--auto-codex-bin="):
+            options["codex_bin"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg == "--auto-task":
+            if i + 1 >= len(argv):
+                raise SystemExit("--auto-task requires a value")
+            task_id = normalize_task_id(argv[i + 1])
+            if not task_id:
+                raise SystemExit("--auto-task must match [A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+            options["task_id"] = task_id
+            i += 2
+            continue
+        if arg.startswith("--auto-task="):
+            task_id = normalize_task_id(arg.split("=", 1)[1])
+            if not task_id:
+                raise SystemExit("--auto-task must match [A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+            options["task_id"] = task_id
+            i += 1
+            continue
+        codex_args.append(arg)
+        i += 1
+    return options, codex_args
+
+
+def normalize_task_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    candidate = value.strip()
+    if not candidate or not TASK_ID_RE.fullmatch(candidate):
+        return None
+    return candidate
+
+
+def effective_task_id(value: str | None) -> str:
+    return normalize_task_id(value) or DEFAULT_TASK_ID
+
+
+def platform_is_windows() -> bool:
+    return os.name == "nt"
+
+
+def codex_executable_names() -> tuple[str, ...]:
+    if platform_is_windows():
+        return ("codex.exe", "codex.cmd", "codex.bat", "codex")
+    return ("codex",)
+
+
+def resolve_codex_bin() -> str:
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_dir:
+            continue
+        for name in codex_executable_names():
+            candidate = pathlib.Path(path_dir).expanduser() / name
+            if not candidate.exists():
+                continue
+            if not platform_is_windows() and not os.access(candidate, os.X_OK):
+                continue
+            resolved = candidate.resolve()
+            if resolved.parent == WRAPPER_DIR and resolved.name.lower() in WRAPPER_NAMES:
+                continue
+            return str(candidate)
+    return "codex.cmd" if platform_is_windows() else "codex"
+
+
+def option_takes_value(arg: str) -> bool:
+    return arg in OPTIONS_WITH_VALUE
+
+
+def first_positional_index(args: list[str], start: int = 0) -> int | None:
+    i = start
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return i + 1 if i + 1 < len(args) else None
+        if option_takes_value(arg):
+            i += 2
+            continue
+        if arg.startswith(OPTIONS_WITH_VALUE_PREFIXES):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return i
+    return None
+
+
+def command_index(args: list[str]) -> int | None:
+    index = first_positional_index(args)
+    if index is None:
+        return None
+    return index if args[index] in KNOWN_SUBCOMMANDS else None
+
+
+def command_name(args: list[str]) -> str | None:
+    index = command_index(args)
+    return args[index] if index is not None else None
+
+
+def scan_option_value(args: list[str], names: set[str]) -> str | None:
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in names and i + 1 < len(args):
+            return args[i + 1]
+        for name in names:
+            if name.startswith("--") and arg.startswith(f"{name}="):
+                return arg.split("=", 1)[1]
+        if option_takes_value(arg):
+            i += 2
+        else:
+            i += 1
+    return None
+
+
+def app_workspace_arg(args: list[str], app_index: int) -> str | None:
+    i = app_index + 1
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg in {"-c", "--config", "--download-url", "--enable", "--disable"}:
+            i += 2
+            continue
+        if arg.startswith(("--config=", "--download-url=", "--enable=", "--disable=")):
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return arg
+    return None
+
+
+def run(cmd: list[str], cwd: pathlib.Path) -> str:
+    try:
+        return subprocess.check_output(
+            cmd,
+            cwd=str(cwd),
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def workspace_from_args(args: list[str], cwd: pathlib.Path) -> pathlib.Path:
+    cd_value = scan_option_value(args, {"-C", "--cd"})
+    if cd_value:
+        return pathlib.Path(cd_value).expanduser().resolve()
+
+    subcommand = command_name(args)
+    if subcommand == "app":
+        index = command_index(args)
+        if index is not None:
+            app_path = app_workspace_arg(args, index)
+            if app_path:
+                return pathlib.Path(app_path).expanduser().resolve()
+
+    return cwd.resolve()
+
+
+def workspace_root(path: pathlib.Path) -> pathlib.Path:
+    if not path.exists():
+        return path
+    root = run(["git", "rev-parse", "--show-toplevel"], path)
+    return pathlib.Path(root).resolve() if root else path.resolve()
+
+
+def state_root(root: pathlib.Path, task_id: str | None = None) -> pathlib.Path:
+    return root / TASKS_REL / effective_task_id(task_id)
+
+
+def state_file(root: pathlib.Path, relative_path: str, task_id: str | None = None) -> pathlib.Path:
+    return state_root(root, task_id) / pathlib.Path(relative_path).name
+
+
+def state_rel(relative_path: str, task_id: str | None = None) -> str:
+    return f"{TASKS_REL}/{effective_task_id(task_id)}/{pathlib.Path(relative_path).name}"
+
+
+def current_task_file(root: pathlib.Path) -> pathlib.Path:
+    return root / CURRENT_TASK_REL
+
+
+def read_current_task(root: pathlib.Path) -> str | None:
+    try:
+        return normalize_task_id(current_task_file(root).read_text(encoding="utf-8").strip())
+    except OSError:
+        return None
+
+
+def resolve_task_id(root: pathlib.Path, requested_task_id: str | None) -> str:
+    return normalize_task_id(requested_task_id) or read_current_task(root) or DEFAULT_TASK_ID
+
+
+def write_current_task(root: pathlib.Path, task_id: str | None) -> None:
+    task_id = effective_task_id(task_id)
+    path = current_task_file(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{task_id}\n", encoding="utf-8")
+
+
+def read_json(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def clear_required(root: pathlib.Path, task_id: str | None = None) -> bool:
+    return bool(read_json(state_file(root, GUARD_REL, task_id)).get("clear_required"))
+
+
+def ensure_process_file(root: pathlib.Path, task_id: str | None = None) -> pathlib.Path:
+    task_id = effective_task_id(task_id)
+    path = state_file(root, PROCESS_REL, task_id)
+    process_rel = state_rel(PROCESS_REL, task_id)
+    auto_rel = state_rel(AUTO_REL, task_id)
+    recent_rel = state_rel(RECENT_REL, task_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(
+            f"""# Process State
+
+Updated: {now()}
+Workspace: {root}
+Branch: (unknown)
+Task ID: {task_id}
+
+## Current Task
+- Restore this workspace from file-backed state after a controlled context switch.
+
+## Done
+- `codex-auto` created this placeholder because no semantic process file existed.
+
+## Key Files
+- `{process_rel}` - semantic handoff state.
+- `{auto_rel}` - hook-written objective snapshot, if present.
+- `{recent_rel}` - recent transcript fallback, if present.
+
+## Verification
+- NOT RUN: no project verification was run by the launcher.
+
+## Current Constraints
+- Do not rely on previous chat history after compact, clear, or resume.
+- Reconstruct task state from files before changing project code.
+
+## Next Step
+1. Inspect `{auto_rel}` and `{recent_rel}` if this file is not enough.
+""",
+            encoding="utf-8",
+        )
+    return path
+
+
+def reset_guard(root: pathlib.Path, task_id: str | None = None) -> pathlib.Path | None:
+    guard_path = state_file(root, GUARD_REL, task_id)
+    guard = read_json(guard_path)
+    backup_path: pathlib.Path | None = None
+
+    if guard_path.exists():
+        backup_path = guard_path.with_name(f"context_guard.before-auto-clear.{stamp()}.json")
+        backup_path.write_text(guard_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    guard.update(
+        {
+            "auto_compact_count": 0,
+            "clear_required": False,
+            "last_event": "LauncherReset",
+            "last_trigger": "codex-auto",
+            "last_source": "fresh-session",
+            "last_reset_source": "codex-auto-launcher",
+            "last_reset_at": now(),
+            "last_updated": now(),
+        }
+    )
+    write_json(guard_path, guard)
+    return backup_path
+
+
+def original_prompt(args: list[str]) -> str:
+    subcommand = command_name(args)
+    if subcommand is None:
+        index = first_positional_index(args)
+        return args[index] if index is not None else ""
+
+    if subcommand not in {"resume", "fork"}:
+        return ""
+
+    start = (command_index(args) or 0) + 1
+    positionals: list[str] = []
+    i = start
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            positionals.extend(args[i + 1 :])
+            break
+        if arg in RESUME_FLAGS:
+            i += 1
+            continue
+        if option_takes_value(arg):
+            i += 2
+            continue
+        if arg.startswith(OPTIONS_WITH_VALUE_PREFIXES) or arg.startswith("-"):
+            i += 1
+            continue
+        positionals.append(arg)
+        i += 1
+
+    if len(positionals) >= 2:
+        return positionals[-1]
+    if len(positionals) == 1 and not re.fullmatch(r"[0-9a-fA-F-]{20,}", positionals[0]):
+        return positionals[0]
+    return ""
+
+
+def global_options(args: list[str]) -> list[str]:
+    stop = command_index(args)
+    limit = stop if stop is not None else len(args)
+    kept: list[str] = []
+    i = 0
+    while i < limit:
+        arg = args[i]
+        if arg == "--":
+            break
+        if arg in {"-C", "--cd"}:
+            i += 2
+            continue
+        if arg.startswith("--cd="):
+            i += 1
+            continue
+        if option_takes_value(arg):
+            if i + 1 < limit:
+                kept.extend([arg, args[i + 1]])
+            i += 2
+            continue
+        if arg.startswith(OPTIONS_WITH_VALUE_PREFIXES) or arg.startswith("-"):
+            kept.append(arg)
+            i += 1
+            continue
+        break
+    return kept
+
+
+def write_resume_file(
+    root: pathlib.Path,
+    prompt: str,
+    backup_path: pathlib.Path | None,
+    task_id: str | None = None,
+) -> pathlib.Path:
+    task_id = effective_task_id(task_id)
+    process_path = ensure_process_file(root, task_id)
+    resume_path = state_file(root, RESUME_REL, task_id)
+    resume_path.parent.mkdir(parents=True, exist_ok=True)
+    backup_display = str(backup_path) if backup_path else "(none)"
+    user_prompt = prompt or "(none)"
+    process_rel = state_rel(PROCESS_REL, task_id)
+    auto_rel = state_rel(AUTO_REL, task_id)
+    recent_rel = state_rel(RECENT_REL, task_id)
+    guard_rel = state_rel(GUARD_REL, task_id)
+    resume_path.write_text(
+        f"""# Codex Auto Resume
+
+Updated: {now()}
+Workspace: {root}
+Task ID: {task_id}
+Guard Backup: {backup_display}
+
+This file was written by `codex-auto` after the workspace reached the controlled-clear threshold.
+
+## Restore Order
+1. Read `{process_rel}` first.
+2. If `{process_rel}` is stale, missing useful details, or still a template, inspect `{auto_rel}` and `{recent_rel}`.
+3. Continue with one concrete next action. Do not rely on previous chat history.
+
+## User Prompt
+```text
+{user_prompt}
+```
+
+## Key State Files
+- `{process_rel}` - semantic handoff state.
+- `{auto_rel}` - objective hook snapshot.
+- `{recent_rel}` - recent transcript fallback.
+- `{guard_rel}` - controlled-clear guard, reset by this launcher.
+
+## Process File
+{process_path}
+""",
+        encoding="utf-8",
+    )
+    return resume_path
+
+
+def restore_prompt(root: pathlib.Path, prompt: str, task_id: str | None = None) -> str:
+    task_id = effective_task_id(task_id)
+    prompt_block = ""
+    if prompt:
+        prompt_block = f"\n\nUser prompt to continue after restore:\n{prompt}"
+    process_rel = state_rel(PROCESS_REL, task_id)
+    auto_rel = state_rel(AUTO_REL, task_id)
+    recent_rel = state_rel(RECENT_REL, task_id)
+    return (
+        "This is a fresh Codex context created by `codex-auto` after the workspace reached "
+        "the controlled-clear threshold.\n\n"
+        f"Workspace: {root}\n\n"
+        f"Task ID: {task_id}\n"
+        "Before doing substantial work:\n"
+        f"1. Read `{process_rel}`.\n"
+        f"2. If that file is stale, missing, or still a template, inspect `{auto_rel}` and `{recent_rel}`.\n"
+        "3. Reconstruct the current task, verification state, constraints, and next step from files.\n"
+        f"4. Continue with one concrete next action and keep `{process_rel}` current.\n"
+        "Do not rely on previous chat history."
+        f"{prompt_block}"
+    )
+
+
+def app_command_with_workspace(codex_bin: str, args: list[str], root: pathlib.Path) -> list[str]:
+    if args and command_name(args) == "app":
+        return [codex_bin] + args
+    return [codex_bin, "app", str(root)]
+
+
+def build_plan(args: list[str], cwd: pathlib.Path, codex_bin: str, task_id: str | None = None) -> dict[str, Any]:
+    workspace = workspace_root(workspace_from_args(args, cwd))
+    task_id = resolve_task_id(workspace, task_id)
+    subcommand = command_name(args)
+    requires_clear = clear_required(workspace, task_id)
+
+    if not requires_clear:
+        return {
+            "action": "passthrough",
+            "workspace": str(workspace),
+            "task_id": task_id,
+            "clear_required": False,
+            "command": [codex_bin] + args,
+            "resume_file": "",
+            "guard_backup": "",
+        }
+
+    prompt = original_prompt(args)
+    if subcommand == "app":
+        command = app_command_with_workspace(codex_bin, args, workspace)
+        action = "desktop-app-new-context"
+    else:
+        command = [codex_bin] + global_options(args) + ["-C", str(workspace), restore_prompt(workspace, prompt, task_id)]
+        action = "fresh-session"
+
+    return {
+        "action": action,
+        "workspace": str(workspace),
+        "task_id": task_id,
+        "clear_required": True,
+        "command": command,
+        "resume_file": str(state_file(workspace, RESUME_REL, task_id)),
+        "guard_backup": "",
+        "original_prompt": prompt,
+    }
+
+
+def apply_auto_clear(plan: dict[str, Any]) -> dict[str, Any]:
+    if not plan.get("clear_required"):
+        return plan
+    root = pathlib.Path(str(plan["workspace"]))
+    task_id = effective_task_id(str(plan.get("task_id") or ""))
+    backup_path = reset_guard(root, task_id)
+    resume_path = write_resume_file(root, str(plan.get("original_prompt") or ""), backup_path, task_id)
+    plan["resume_file"] = str(resume_path)
+    plan["guard_backup"] = str(backup_path) if backup_path else ""
+    return plan
+
+
+def emit_plan(plan: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        sys.stdout.write(json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
+        return
+
+    sys.stdout.write(f"codex-auto action: {plan['action']}\n")
+    sys.stdout.write(f"workspace: {plan['workspace']}\n")
+    if plan.get("task_id"):
+        sys.stdout.write(f"task_id: {plan['task_id']}\n")
+    sys.stdout.write(f"clear_required: {plan['clear_required']}\n")
+    if plan.get("resume_file"):
+        sys.stdout.write(f"resume_file: {plan['resume_file']}\n")
+    if plan.get("guard_backup"):
+        sys.stdout.write(f"guard_backup: {plan['guard_backup']}\n")
+    sys.stdout.write("command:\n")
+    sys.stdout.write(" ".join(plan["command"]) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    wrapper_options, codex_args = parse_wrapper_args(list(sys.argv[1:] if argv is None else argv))
+    cwd = pathlib.Path.cwd()
+    plan = build_plan(
+        codex_args,
+        cwd,
+        str(wrapper_options["codex_bin"]),
+        normalize_task_id(str(wrapper_options.get("task_id") or "")),
+    )
+
+    if not wrapper_options["dry_run"]:
+        write_current_task(pathlib.Path(str(plan["workspace"])), str(plan["task_id"]))
+
+    if not wrapper_options["dry_run"] and plan.get("clear_required"):
+        plan = apply_auto_clear(plan)
+
+    if wrapper_options["dry_run"] or wrapper_options["no_exec"]:
+        emit_plan(plan, bool(wrapper_options["json"]))
+        return 0
+
+    if platform_is_windows():
+        return subprocess.call(plan["command"])
+    os.execvp(plan["command"][0], plan["command"])
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

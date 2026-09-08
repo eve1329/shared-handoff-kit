@@ -1,0 +1,3 @@
+#!/bin/sh
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+exec "$CODEX_HOME/bin/codex-auto" "$@"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task ID Bootstrap"
+  short_description: "Initialize and bind repo task-id state"
+  default_prompt: "Use $task-id-bootstrap to open task-id=example-task and bind the current Codex task."
