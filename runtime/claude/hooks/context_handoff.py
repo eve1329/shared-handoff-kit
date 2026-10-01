@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """Claude Code Stop hook for task-local handoff snapshots shared with Codex.
 
 Every session resolves to a task. A valid current or explicit task wins; otherwise

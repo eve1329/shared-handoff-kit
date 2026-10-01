@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """Claude Code UserPromptSubmit hook — parse task-id from prompt and inject handoff context.
 
 Task-id patterns supported in user prompts:

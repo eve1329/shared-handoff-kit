@@ -97,6 +97,70 @@ class SharedHandoffInstallTests(unittest.TestCase):
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "locally modified\n")
             self.assertNotEqual(target.read_text(encoding="utf-8"), "locally modified\n")
 
+    def test_install_excludes_repository_metadata_and_preserves_config_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            codex = root / "codex"
+            claude = root / "claude"
+            codex.mkdir()
+            claude.mkdir()
+            codex_settings = codex / "hooks.json"
+            claude_settings = claude / "settings.json"
+            codex_settings.write_text("{}\n", encoding="utf-8")
+            claude_settings.write_text("{}\n", encoding="utf-8")
+            codex_settings.chmod(0o600)
+            claude_settings.chmod(0o600)
+
+            result = run_script(INSTALL, "--codex-home", str(codex), "--claude-home", str(claude))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed_skill = codex / "skills/shared-handoff-kit"
+            self.assertFalse((installed_skill / ".git").exists())
+            self.assertFalse((installed_skill / ".gitignore").exists())
+            self.assertEqual(codex_settings.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(claude_settings.stat().st_mode & 0o777, 0o600)
+
+    def test_reinstall_updates_managed_hooks_and_global_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            codex = root / "codex"
+            claude = root / "claude"
+            first = run_script(INSTALL, "--codex-home", str(codex), "--claude-home", str(claude))
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            for settings_path in (codex / "hooks.json", claude / "settings.json"):
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                for groups in settings["hooks"].values():
+                    for group in groups:
+                        group["matcher"] = "stale"
+                        for hook in group["hooks"]:
+                            hook["timeout"] = 1
+                settings_path.write_text(json.dumps(settings) + "\n", encoding="utf-8")
+
+            agents_path = codex / "AGENTS.md"
+            agents = agents_path.read_text(encoding="utf-8")
+            marker = "<!-- shared-handoff-kit:global-contract -->"
+            self.assertEqual(agents.count(marker), 2)
+            start = agents.index(marker)
+            end = agents.index(marker, start + len(marker)) + len(marker)
+            agents_path.write_text(agents[:start] + f"{marker}\nSTALE CONTRACT\n{marker}" + agents[end:], encoding="utf-8")
+
+            second = run_script(INSTALL, "--codex-home", str(codex), "--claude-home", str(claude))
+            self.assertEqual(second.returncode, 0, second.stderr)
+
+            codex_settings = json.loads((codex / "hooks.json").read_text(encoding="utf-8"))
+            self.assertEqual(codex_settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact")
+            self.assertEqual(codex_settings["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 10)
+            self.assertEqual(codex_settings["hooks"]["PreCompact"][0]["matcher"], "manual|auto")
+            self.assertEqual(codex_settings["hooks"]["PreCompact"][0]["hooks"][0]["timeout"], 20)
+
+            claude_settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(claude_settings["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact")
+            self.assertEqual(claude_settings["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 10)
+            self.assertNotIn("STALE CONTRACT", agents_path.read_text(encoding="utf-8"))
+            self.assertEqual(agents_path.read_text(encoding="utf-8").count(marker), 2)
+            self.assertIn("Global Context Handoff", agents_path.read_text(encoding="utf-8"))
+
     def test_malformed_settings_are_not_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)

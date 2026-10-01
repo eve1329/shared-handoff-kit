@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """Claude Code SessionStart hook for restoring task-local context.
 
 Resolution uses the Claude session mapping, then a valid current-task pointer,

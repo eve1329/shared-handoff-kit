@@ -9,8 +9,11 @@ import json
 import os
 import py_compile
 import re
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +62,79 @@ def check(condition: bool, message: str) -> None:
     print(f"PASS: {message}")
 
 
+def run_runtime_hook(
+    script: Path,
+    payload: dict[str, Any],
+    root: Path,
+    environment: dict[str, str],
+) -> None:
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        input=json.dumps(payload, ensure_ascii=False),
+        cwd=str(root),
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    check(
+        result.returncode == 0,
+        f"runtime hook executes: {script.relative_to(PACKAGE_ROOT)}"
+        + (f" ({result.stderr.strip()})" if result.returncode else ""),
+    )
+    try:
+        output = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"runtime hook returned invalid JSON: {script.relative_to(PACKAGE_ROOT)}: {error}"
+        ) from error
+    check(isinstance(output, dict), f"runtime hook returns JSON object: {script.relative_to(PACKAGE_ROOT)}")
+
+
+def verify_runtime_entrypoints() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        environment = os.environ.copy()
+        environment["CODEX_HOME"] = str(root / "codex-home")
+
+        scenarios = (
+            (
+                RUNTIME_ROOT / "codex" / "hooks" / "context_handoff.py",
+                {"hook_event_name": "SessionStart", "source": "startup", "cwd": str(root)},
+            ),
+            (
+                RUNTIME_ROOT / "codex" / "hooks" / "context_handoff.py",
+                {"hook_event_name": "UserPromptSubmit", "prompt": "task=verify-smoke", "cwd": str(root)},
+            ),
+            (
+                RUNTIME_ROOT / "codex" / "hooks" / "context_handoff.py",
+                {"hook_event_name": "PreCompact", "trigger": "auto", "cwd": str(root)},
+            ),
+            (
+                RUNTIME_ROOT / "codex" / "hooks" / "context_handoff.py",
+                {"hook_event_name": "PostCompact", "trigger": "auto", "cwd": str(root)},
+            ),
+            (
+                RUNTIME_ROOT / "codex" / "hooks" / "context_handoff.py",
+                {"hook_event_name": "Stop", "cwd": str(root)},
+            ),
+            (
+                RUNTIME_ROOT / "claude" / "hooks" / "session_start.py",
+                {"cwd": str(root), "session_id": "verify-claude"},
+            ),
+            (
+                RUNTIME_ROOT / "claude" / "hooks" / "task_context.py",
+                {"cwd": str(root), "prompt": "task=verify-smoke", "session_id": "verify-claude"},
+            ),
+            (
+                RUNTIME_ROOT / "claude" / "hooks" / "context_handoff.py",
+                {"cwd": str(root), "session_id": "verify-claude"},
+            ),
+        )
+        for script, payload in scenarios:
+            run_runtime_hook(script, payload, root, environment)
+
+
 def target_platform(value: str) -> str:
     if value != "auto":
         return value
@@ -79,6 +155,7 @@ def verify_package() -> None:
     hooks = json.loads((RUNTIME_ROOT / "codex" / "hooks.json").read_text(encoding="utf-8"))
     events = set(hooks.get("hooks", {}))
     check({"SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact", "Stop"} <= events, "Codex hook events are registered")
+    verify_runtime_entrypoints()
     documentation = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in PACKAGE_ROOT.rglob("*.md"))
     check(not re.search(r"sk-[A-Za-z0-9]{16,}", documentation), "bundle documentation contains no API token")
     all_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in PACKAGE_ROOT.rglob("*") if path.is_file() and "__pycache__" not in path.parts)
@@ -149,7 +226,7 @@ def main() -> int:
         verify_package()
         platform = target_platform(args.platform)
         verify_installed(args.codex_home, args.claude_home, platform)
-    except (OSError, RuntimeError, json.JSONDecodeError, py_compile.PyCompileError) as error:
+    except (OSError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, py_compile.PyCompileError) as error:
         print(f"FAIL: {error}")
         return 1
     print(f"Shared Handoff Kit verification complete (platform: {target_platform(args.platform)}).")

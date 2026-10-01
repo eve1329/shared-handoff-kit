@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -19,7 +20,7 @@ from typing import Any
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_ROOT = PACKAGE_ROOT / "runtime"
 SKILL_NAME = PACKAGE_ROOT.name
-SKIP_NAMES = {".DS_Store", "__pycache__"}
+SKIP_NAMES = {".DS_Store", ".git", ".gitignore", "__pycache__"}
 
 
 def timestamp() -> str:
@@ -92,7 +93,9 @@ def backup_existing(path: Path, dry_run: bool) -> Path | None:
     return backup
 
 
-def atomic_write(path: Path, content: bytes, mode: int, dry_run: bool) -> bool:
+def atomic_write(path: Path, content: bytes, mode: int | None, dry_run: bool) -> bool:
+    if mode is None:
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o644
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.is_file() and path.read_bytes() == content:
@@ -129,7 +132,7 @@ def install_file(source: Path, target: Path, dry_run: bool) -> bool:
     return atomic_write(target, source.read_bytes(), mode, dry_run)
 
 
-def install_text(target: Path, content: str, dry_run: bool, mode: int = 0o644) -> bool:
+def install_text(target: Path, content: str, dry_run: bool, mode: int | None = None) -> bool:
     return atomic_write(target, content.encode("utf-8"), mode, dry_run)
 
 
@@ -158,19 +161,6 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def has_command(groups: list[Any], command: str) -> bool:
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        hooks = group.get("hooks")
-        if not isinstance(hooks, list):
-            continue
-        for hook in hooks:
-            if isinstance(hook, dict) and hook.get("command") == command:
-                return True
-    return False
-
-
 def add_hook(
     settings: dict[str, Any],
     event: str,
@@ -186,11 +176,29 @@ def add_hook(
     groups = hooks.setdefault(event, [])
     if not isinstance(groups, list):
         raise ValueError(f"settings.hooks.{event} must be an array")
-    if has_command(groups, command):
-        return
     hook: dict[str, Any] = {"type": "command", "command": command, "timeout": timeout}
     if status_message:
         hook["statusMessage"] = status_message
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        existing_hooks = group.get("hooks")
+        if not isinstance(existing_hooks, list):
+            continue
+        for existing in existing_hooks:
+            if not isinstance(existing, dict) or existing.get("command") != command:
+                continue
+            existing.update(hook)
+            if status_message is None:
+                existing.pop("statusMessage", None)
+            if len(existing_hooks) == 1:
+                if matcher:
+                    group["matcher"] = matcher
+                else:
+                    group.pop("matcher", None)
+            return
+
     group: dict[str, Any] = {"hooks": [hook]}
     if matcher:
         group["matcher"] = matcher
@@ -220,13 +228,25 @@ def merge_claude_settings(path: Path, claude_home: Path, platform: str) -> str:
 def install_global_agents(path: Path, source: Path, dry_run: bool) -> None:
     source_text = source.read_text(encoding="utf-8").strip()
     marker = "<!-- shared-handoff-kit:global-contract -->"
+    managed_block = f"{marker}\n{source_text}\n{marker}"
     if path.exists():
         existing = path.read_text(encoding="utf-8")
-        if source_text in existing or marker in existing:
-            return
-        content = f"{existing.rstrip()}\n\n{marker}\n{source_text}\n{marker}\n"
+        marker_count = existing.count(marker)
+        if marker_count == 2:
+            managed_pattern = re.compile(
+                rf"{re.escape(marker)}\n.*?\n{re.escape(marker)}",
+                re.DOTALL,
+            )
+            content = managed_pattern.sub(f"{marker}\n{source_text}\n{marker}", existing, count=1)
+        elif marker_count == 0:
+            if source_text in existing:
+                content = existing.replace(source_text, managed_block, 1)
+            else:
+                content = f"{existing.rstrip()}\n\n{managed_block}\n"
+        else:
+            raise ValueError(f"global contract markers are malformed: {path}")
     else:
-        content = source_text + "\n"
+        content = managed_block + "\n"
     install_text(path, content, dry_run)
 
 

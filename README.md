@@ -24,7 +24,7 @@ task-local 的任务状态，让 AI 在「compact / clear / resume / 新线程 /
 
 ## 安装要求
 
-- Python 3（`python3`；Windows 上可用 `py -3` 或 `python`）
+- Python 3.9+（`python3`；Windows 上可用 `py -3` 或 `python`）
 - 已安装 Codex CLI 和/或 Claude Code CLI
 - 目标工作仓库（要被这套工作流管理的项目目录）
 
@@ -170,7 +170,7 @@ AI 先解析出同一个 task-id，再读取该任务的 `process.md` 恢复上�
 ## 校验
 
 ```bash
-# 只校验包本身（必需文件、Python 语法、hook 注册、无 token/机器路径泄露）
+# 只校验包本身（必需文件、Python 语法、运行时 hook smoke、hook 注册、无 token/机器路径泄露）
 python3 scripts/verify.py
 
 # 同时校验已安装的 Codex / Claude 运行时（逐字节比对 + hook 注册检查）

@@ -31,6 +31,8 @@ controlled clear 规则放在一个可分享目录里。
 - 将已有目标文件按时间戳备份，合并 hook 配置，保留其它设置和密钥；不会写入任何代理、模型或 token 配置。
 - 在 Windows 安装 `codex-auto.py`、`codex.cmd`、`codex-auto.cmd`；hook 使用 `py -3 "<path>"`，锁实现使用 `msvcrt`。macOS/Linux 保留 shell wrapper、`python3` 和 `flock` 路径。
 
+运行时要求 Python 3.9 或更高版本；安装后的校验除了语法检查，还会实际执行 Codex/Claude hook smoke 场景并验证 JSON 输出。
+
 ## 行为契约
 
 - 状态只写入 `.agents/state/tasks/<task-id>/`。`process.md` 是语义真相，`process.auto.md` 是 hook 快照，`process.recent.md` 是短期 fallback，`context_guard.json` 记录自动 compact 次数。
