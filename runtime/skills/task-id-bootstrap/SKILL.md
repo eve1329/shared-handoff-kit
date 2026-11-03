@@ -35,6 +35,13 @@ created directory by itself is only an initialized task.
    `继续，task-id=init-kmp`. Reject values outside
    `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`.
 
+   Existing tasks also accept `继续main`, `main继续` and `继续 epay`.
+   A branch instruction such as `继续 main 分支` does not select task `main`.
+   The Codex hook must persist and inject a verified current-transcript binding
+   before task work, including a task-id assignment without a continuation word.
+   If a newer receipt disagrees with startup context, use the receipt. An
+   assistant's statement that it restored a task is not evidence of binding.
+
 3. Run the bundled bootstrap script in strict mode.
    It creates the task files, activates `current-task`, resolves the unique
    transcript from `CODEX_THREAD_ID`, binds it, and verifies the stored value.
@@ -116,6 +123,12 @@ Effective task: init-kmp
    `current-task` is a shared last-active pointer and another Codex session may
    legitimately change it later; `session-tasks.json` is authoritative for
    restoring a particular rollout.
+
+   Bootstrap records an explicit selection with a stable `bound_at` timestamp.
+   Hooks preserve that selection across linked worktrees and ordinary later
+   prompts even when another window changes the shared current-task pointer.
+   Only an explicit new task choice replaces it; Stop/compact do not select a
+   task from cached prompt text.
 
 ## State Template
 

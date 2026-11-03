@@ -26,6 +26,24 @@ uses them for semantic restoration.
 
 ## Session ownership and linked worktrees
 
+Codex routing also accepts leading shorthand `继续main`, `main继续`, or
+`继续 epay，...` for an existing task (`main` is always available). Explicit
+Git branch commands and unknown shorthand words do not select tasks. An explicit
+`task-id=<id>` can create a new task. Each UserPromptSubmit resolves, writes and
+reads back the exact transcript binding under one routing lock, then injects a
+verified receipt before model work, even for regular follow-up prompts. Missing
+or ambiguous transcript identity is reported as `NOT VERIFIED`; a unique rollout
+lookup by thread ID can recover an omitted transcript path.
+
+Binding entries retain `binding_source`, `binding_strength`, `bound_at` and
+`binding_workspace` alongside `task_id`/`updated`. Explicit prompt/bootstrap
+selections outrank provisional startup/default pointers and legacy mappings;
+within the same strength the latest selection wins across linked worktrees of
+the same Git repository. Routine hooks update `updated` without advancing
+`bound_at`. Stop never reselects a task from cached prompt text. Activation
+queries `--binding-status` before falling back to current-task. This mode accepts
+hook JSON on stdin and does not write state. Semantic process files stay local.
+
 `context_guard.json` keeps a top-level compatibility snapshot and a `sessions` map
 keyed by normalized transcript path (or explicit thread/session ID when no path
 is available). Semantic task state stays in the selected worktree's `process.md`.

@@ -16,16 +16,48 @@ INSTALL = ROOT / "scripts" / "install.py"
 VERIFY = ROOT / "scripts" / "verify.py"
 
 
-def run_script(script: pathlib.Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_script(script: pathlib.Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.pop("CODEX_THREAD_ID", None)
+    if env:
+        environment.update(env)
     return subprocess.run(
         [sys.executable, str(script), *args],
         cwd=str(ROOT),
         text=True,
         capture_output=True,
+        env=environment,
     )
 
 
 class SharedHandoffInstallTests(unittest.TestCase):
+    def test_activation_preserves_session_binding_when_shared_pointer_changed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            codex, claude, project = base / "codex", base / "claude", base / "project"
+            project.mkdir()
+            first = run_script(INSTALL, "--codex-home", str(codex), "--claude-home", str(claude))
+            self.assertEqual(first.returncode, 0, first.stderr)
+            thread = "019eb4bd-dbf7-7432-843e-0317ed0639ea"
+            sessions = codex / "sessions"
+            sessions.mkdir()
+            transcript = sessions / f"rollout-test-{thread}.jsonl"
+            transcript.write_text("")
+            state = project / ".agents/state"
+            state.mkdir(parents=True)
+            (state / "current-task").write_text("wrong-task\n")
+            (state / "session-tasks.json").write_text(json.dumps({"sessions": {str(transcript.resolve()): {
+                "task_id": "epay", "binding_source": "bootstrap", "binding_strength": "explicit",
+                "bound_at": "2026-01-01T00:00:00+00:00"}}}))
+            result = run_script(ACTIVATE, "--repo", str(project), "--codex-home", str(codex),
+                "--claude-home", str(claude), env={"CODEX_THREAD_ID": thread})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((state / "current-task").read_text().strip(), "epay")
+            mapping = json.loads((state / "session-tasks.json").read_text())["sessions"][str(transcript.resolve())]
+            self.assertEqual(mapping["task_id"], "epay")
+            self.assertEqual(mapping["binding_strength"], "explicit")
+            self.assertIn("Effective task: epay", result.stdout)
+
     def test_dry_run_does_not_create_target_directories(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = pathlib.Path(td)

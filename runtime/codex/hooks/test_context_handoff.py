@@ -42,6 +42,7 @@ def run_hook(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     effective_env = os.environ.copy()
+    effective_env.pop("CODEX_THREAD_ID", None)
     if env:
         effective_env.update(env)
     return subprocess.run(
@@ -413,7 +414,7 @@ Branch: main
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), {})
+            self.assertIn("Task binding: VERIFIED", json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"])
 
             task_state = cwd / ".agents" / "state" / "tasks" / "issue-kmp"
             self.assertTrue((task_state / "process.md").exists())

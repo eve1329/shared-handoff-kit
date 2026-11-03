@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -55,9 +56,24 @@ def resolve_repo(args: argparse.Namespace) -> Path | None:
     return None if caller == PACKAGE_ROOT else caller
 
 
-def resolve_task_id(repo: Path, explicit_task_id: str | None) -> str:
+def resolve_task_id(repo: Path, explicit_task_id: str | None, codex_home: Path | None = None) -> str:
     if explicit_task_id:
         return explicit_task_id.strip()
+
+    selected_home = codex_home or default_codex_home()
+    hook = selected_home / "hooks" / "context_handoff.py"
+    if hook.is_file():
+        result = subprocess.run([sys.executable, str(hook), "--binding-status"],
+            input=json.dumps({"cwd": str(repo)}), text=True, capture_output=True, timeout=30,
+            env={**os.environ, "CODEX_HOME": str(selected_home)})
+        if result.returncode == 0:
+            try:
+                binding = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                binding = {}
+            candidate = binding.get("task_id") if isinstance(binding, dict) else None
+            if isinstance(candidate, str) and TASK_ID_RE.fullmatch(candidate):
+                return candidate
 
     pointer = repo / ".agents" / "state" / "current-task"
     try:
@@ -108,7 +124,7 @@ def main() -> int:
         print("AI activation complete. Runtime is installed and verified; no target worktree was selected for task state.")
         return 0
 
-    task_id = resolve_task_id(repo, args.task_id)
+    task_id = resolve_task_id(repo, args.task_id, codex_home)
     bootstrap = codex_home / "skills" / "task-id-bootstrap" / "scripts" / "bootstrap_task_id.py"
     task_command = [
         sys.executable,

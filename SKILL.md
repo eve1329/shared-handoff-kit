@@ -37,6 +37,8 @@ controlled clear 规则放在一个可分享目录里。
 
 - 状态只写入 `.agents/state/tasks/<task-id>/`。`process.md` 是语义真相，`process.auto.md` 是 hook 快照，`process.recent.md` 是短期 fallback，`context_guard.json` 记录自动 compact 次数。
 - task-id 解析顺序是显式 payload、prompt 中的 `task=<id>`/`task-id=<id>`、当前 session 映射、有效的 `current-task`，最后才是 `main`。
+- Codex 也把已存在任务的 `继续main`、`main继续`、`继续 epay` 当成显式任务选择；`继续 main 分支` 等 Git 操作不切任务。新任务或有歧义的名字使用 `task-id=<id>`。
+- Codex 每次 UserPromptSubmit 都先写入并读回核对当前 transcript 的绑定，再注入 `Task binding: VERIFIED`、任务路径和来源。后续普通消息、compact/resume 和 linked worktree 恢复沿用该会话绑定，不得仅凭 `current-task` 或旧 startup 提示改绑。缺少唯一 transcript 时输出 `NOT VERIFIED`，不能口头宣称已切换。
 - 每次有意义的工作后更新当前 task 的 `process.md`；在 `compact`、`clear`、`resume` 或 `/handoff` 前必须包含 Current Task、Done、Key Files、Verification、Current Constraints、Next Step。
 - 自动 compact 达到 guard 的阈值（默认 3 次）后，下一次实质性工作前要求 controlled clear；恢复时先读同一个 task-local `process.md`。
 - compact 计数归属当前 transcript/session；`SessionStart(startup)`（新窗口）与 `SessionStart(clear)` 都重置该会话，`resume`/`compact` 保留计数。不能用另一个会话的旧 guard 要求用户再次 clear。
@@ -49,6 +51,9 @@ controlled clear 规则放在一个可分享目录里。
 
 自动启用使用当前工作仓库已有的有效 task-id；没有时初始化 `main`。它会尝试绑定当前
 rollout；运行环境未暴露 transcript 时，只报告 task 文件已初始化，不能虚报为已绑定。
+Codex 启用流程先查询当前会话绑定；即使另一个窗口改了 `current-task`，也保留已绑定任务。
+显式选择的 `bound_at` 与普通事件的 `updated` 分开保存；跨 linked worktree 先选显式绑定、
+再按选择时间取最新记录，日常 Stop 快照不能把旧任务变成新的选择。
 
 用户说“继续”“handoff”“新上下文”“compact”时，先解析同一个 task，再读取
 `.agents/state/tasks/<task-id>/process.md`。不要把旧的 root-level

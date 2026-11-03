@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from collections import deque
+from contextlib import nullcontext
 from typing import Any
 
 from shared_handoff_lock import exclusive_file_lock
@@ -94,7 +95,14 @@ def session_cwd(data: dict[str, Any]) -> pathlib.Path:
 
 
 def session_transcript_path(data: dict[str, Any]) -> str:
-    return str(data.get("transcript_path") or "")
+    explicit = str(data.get("transcript_path") or "")
+    if explicit:
+        return str(pathlib.Path(explicit).expanduser().absolute())
+    thread = normalize_task_id(str(data.get("thread_id") or data.get("session_id") or os.environ.get("CODEX_THREAD_ID") or ""))
+    if not thread:
+        return ""
+    matches = list((codex_home() / "sessions").glob(f"**/rollout-*-{thread}.jsonl"))
+    return str(matches[0].resolve()) if len(matches) == 1 else ""
 
 
 def workspace_root(cwd: pathlib.Path) -> pathlib.Path:
@@ -320,6 +328,27 @@ def prompt_task_id(prompt: str) -> str | None:
     return None
 
 
+def continuation_task_id(root: pathlib.Path, prompt: str) -> str | None:
+    # Only known task names qualify as shorthand; ordinary '继续 debug' and
+    # explicit Git branch instructions must not silently create/switch tasks.
+    text = prompt.strip()
+    for pattern in (
+        r"^(?:继续|接着|恢复)\s*`?([A-Za-z0-9][A-Za-z0-9._-]{0,79})`?(?=$|[\s，。,:：;；])",
+        r"^`?([A-Za-z0-9][A-Za-z0-9._-]{0,79})`?\s*(?:继续|接着)(?=$|[\s，。,:：;；])",
+    ):
+        match = re.match(pattern, text)
+        if not match:
+            continue
+        if re.match(r"\s*(?:分支|branch\b)", text[match.end():], re.IGNORECASE):
+            return None
+        candidate = normalize_task_id(match.group(1))
+        if candidate and (candidate == DEFAULT_TASK_ID or any(
+            state_root(peer, candidate).is_dir() for peer in dict.fromkeys([root, *linked_worktree_roots(root)])
+        )):
+            return candidate
+    return None
+
+
 def read_task_sessions(root: pathlib.Path) -> dict[str, Any]:
     path = task_sessions_path(root)
     try:
@@ -340,34 +369,56 @@ def write_task_sessions(root: pathlib.Path, value: dict[str, Any]) -> pathlib.Pa
     return path
 
 
-def resolve_task_id(root: pathlib.Path, data: dict[str, Any]) -> str:
+def resolve_task_binding(root: pathlib.Path, data: dict[str, Any]) -> dict[str, Any]:
     explicit = normalize_task_id(str(data.get("task_id") or data.get("taskId") or ""))
-    if explicit:
-        return explicit
-
     prompt = str(data.get("prompt") or "")
-    prompt_task = prompt_task_id(prompt)
-    if prompt_task:
-        return prompt_task
+    can_select = str(data.get("hook_event_name") or data.get("hookEventName") or "") in {"", "UserPromptSubmit"}
+    prompt_task = (prompt_task_id(prompt) or continuation_task_id(root, prompt)) if can_select else None
+    requested = explicit or prompt_task
+    if requested:
+        return {"task_id": requested, "binding_source": "explicit" if explicit else "prompt",
+                "binding_strength": "explicit", "bound_at": current_time().isoformat(timespec="microseconds"),
+                "binding_workspace": str(root)}
 
     transcript = session_transcript_path(data)
+    candidates = []
     if transcript:
-        sessions = read_task_sessions(root)
-        session_entry = sessions.get("sessions", {}).get(transcript)
-        if isinstance(session_entry, dict):
+        for peer in dict.fromkeys([root, *linked_worktree_roots(root)]):
+            sessions = read_task_sessions(peer)
+            session_entry = sessions.get("sessions", {}).get(transcript)
+            if not isinstance(session_entry, dict):
+                continue
             mapped = normalize_task_id(str(session_entry.get("task_id") or ""))
             if mapped:
-                return mapped
+                entry = {**session_entry, "task_id": mapped}
+                entry.setdefault("binding_source", "legacy_session")
+                entry.setdefault("binding_workspace", str(peer))
+                candidates.append(entry)
+    if candidates:
+        return max(candidates, key=binding_rank)
 
     current = task_current_path(root)
     if current.exists():
         try:
             mapped = normalize_task_id(current.read_text(encoding="utf-8").strip())
             if mapped:
-                return mapped
+                return {"task_id": mapped, "binding_source": "current-task", "binding_strength": "provisional"}
         except OSError:
             pass
-    return DEFAULT_TASK_ID
+    return {"task_id": DEFAULT_TASK_ID, "binding_source": "default", "binding_strength": "provisional"}
+
+
+def binding_rank(entry: dict[str, Any]) -> tuple[int, float]:
+    strength = 2 if entry.get("binding_strength") == "explicit" else 0 if entry.get("binding_strength") == "provisional" else 1
+    try:
+        timestamp = _dt.datetime.fromisoformat(str(entry.get("bound_at") or entry.get("updated") or "")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        timestamp = 0.0
+    return strength, timestamp
+
+
+def resolve_task_id(root: pathlib.Path, data: dict[str, Any]) -> str:
+    return str(resolve_task_binding(root, data)["task_id"])
 
 
 def write_task_current(root: pathlib.Path, task_id: str) -> pathlib.Path:
@@ -376,18 +427,22 @@ def write_task_current(root: pathlib.Path, task_id: str) -> pathlib.Path:
     return path
 
 
-def register_task_session(root: pathlib.Path, transcript: str, task_id: str) -> pathlib.Path:
+def register_task_session(root: pathlib.Path, transcript: str, task_id: str, binding: dict[str, Any] | None = None, *, lock_held: bool = False) -> pathlib.Path:
     if not transcript:
         return task_sessions_path(root)
     lock_path = task_sessions_lock_path(root)
-    with exclusive_file_lock(lock_path):
+    with nullcontext() if lock_held else exclusive_file_lock(lock_path):
         sessions = read_task_sessions(root)
         sessions.setdefault("sessions", {})
         sessions["sessions"][transcript] = {
+            **(binding or {}),
             "task_id": task_id,
             "updated": now(),
         }
-        return write_task_sessions(root, sessions)
+        path = write_task_sessions(root, sessions)
+        if read_task_sessions(root)["sessions"].get(transcript, {}).get("task_id") != task_id:
+            raise RuntimeError("task session binding verification failed")
+        return path
 
 
 def task_relative_prefix(task_id: str | None) -> str:
@@ -882,6 +937,7 @@ Branch: {branch or "(none)"}
 HEAD: {head or "(none)"}
 Turn ID: {turn_id or "(none)"}
 Transcript: {transcript_path or "(none)"}
+Task Binding Source: {data.get('_task_binding', {}).get('binding_source') or '(not supplied)'}
 
 ## Process State Health
 
@@ -1028,8 +1084,32 @@ def json_out(value: dict[str, Any]) -> int:
     return 0
 
 
+def binding_message(root: pathlib.Path, data: dict[str, Any], task_id: str, binding: dict[str, Any]) -> str:
+    transcript = session_transcript_path(data)
+    if not transcript:
+        return (
+            f"Task binding: NOT VERIFIED for `{task_id}` in `{root}` (exact transcript unavailable).\n"
+            "Run task-id bootstrap with the current rollout before claiming a switch; do not treat current-task as a session binding."
+        )
+    return (
+        f"Task binding: VERIFIED; active task id: `{task_id}`.\n"
+        f"- Workspace: `{root}`; exact transcript: `{transcript}`.\n"
+        f"- Source: `{binding.get('binding_source')}`; bound at: `{binding.get('bound_at') or '(legacy/provisional)'}`.\n"
+        f"- Read/write semantic state only at `{task_process_path(root, task_id)}`.\n"
+        "- This current binding supersedes earlier startup context and the shared current-task pointer. "
+        "A Git branch name does not select a task. Keep this binding until the user explicitly selects another task; "
+        "do not claim to switch tasks in prose without verifying the session mapping."
+    )
+
+
 def main() -> int:
     data = read_input()
+    transcript = session_transcript_path(data)
+    if transcript:
+        data["transcript_path"] = transcript
+    if "--binding-status" in sys.argv[1:]:
+        root = workspace_root(session_cwd(data))
+        return json_out({**resolve_task_binding(root, data), "transcript_path": transcript})
     if "--guard-status" in sys.argv[1:] or "--sync-guard" in sys.argv[1:]:
         root = workspace_root(session_cwd(data))
         task_id = resolve_task_id(root, data)
@@ -1047,9 +1127,14 @@ def main() -> int:
     cwd = session_cwd(data)
     root = workspace_root(cwd)
     branch = run(["git", "branch", "--show-current"], root)
-    task_id = resolve_task_id(root, data)
-    write_task_current(root, task_id)
-    register_task_session(root, session_transcript_path(data), task_id)
+    # Resolve and persist under the same lock: a delayed Stop must not overwrite
+    # a newer explicit selection after reading an older mapping.
+    with exclusive_file_lock(task_sessions_lock_path(root)):
+        binding = resolve_task_binding(root, data)
+        task_id = str(binding["task_id"])
+        data["_task_binding"] = binding
+        write_task_current(root, task_id)
+        register_task_session(root, transcript, task_id, binding, lock_held=True)
 
     goal_context = resolve_goal_context(root, data, task_id)
     goal_active = bool(goal_context.get("active"))
@@ -1066,6 +1151,7 @@ def main() -> int:
             additional_context = context_message(root, process_path, auto_path, task_id, guard)
             if clear_required_is_effective(guard, goal_active):
                 additional_context = clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
+            additional_context = binding_message(root, data, task_id, binding) + "\n\n" + additional_context
             return json_out(
                 {
                     "hookSpecificOutput": {
@@ -1078,19 +1164,19 @@ def main() -> int:
 
     if event == "UserPromptSubmit":
         prompt = str(data.get("prompt") or "")
-        if clear_required_is_effective(guard, goal_active) or CONTINUATION_RE.search(prompt):
-            additional_context = context_message(root, process_path, auto_path, task_id, guard)
+        additional_context = binding_message(root, data, task_id, binding)
+        if clear_required_is_effective(guard, goal_active) or CONTINUATION_RE.search(prompt) or prompt_task_id(prompt) or data.get("task_id") or data.get("taskId"):
+            additional_context += "\n\n" + context_message(root, process_path, auto_path, task_id, guard)
             if clear_required_is_effective(guard, goal_active):
-                additional_context = clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
-            return json_out(
-                {
-                    "hookSpecificOutput": {
-                        "hookEventName": "UserPromptSubmit",
-                        "additionalContext": additional_context,
-                    }
+                additional_context += "\n\n" + clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
+        return json_out(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": additional_context,
                 }
-            )
-        return json_out({})
+            }
+        )
 
     return json_out({})
 

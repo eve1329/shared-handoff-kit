@@ -79,6 +79,9 @@ class BootstrapTaskIdTests(unittest.TestCase):
             self.assertIn("Clear required: false", result.stdout)
             self.assertIn("Last reset: startup", result.stdout)
             self.assertEqual(json.loads(guard_path.read_text())["auto_compact_count"], 1)
+            mapping = read_session_tasks(linked)["sessions"][str(transcript)]
+            self.assertEqual(mapping["binding_source"], "bootstrap")
+            self.assertEqual(mapping["binding_strength"], "explicit")
             auto_text = (guard_path.parent / "process.auto.md").read_text()
             self.assertIn("Auto Compact Count: 1", auto_text)
             self.assertIn(str(transcript), auto_text)

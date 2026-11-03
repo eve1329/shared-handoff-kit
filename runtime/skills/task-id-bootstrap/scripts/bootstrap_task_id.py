@@ -163,6 +163,10 @@ def bind_task_session(repo_root: Path, transcript: str, task_id: str) -> str:
         session_tasks["sessions"][transcript] = {
             "task_id": task_id,
             "updated": now(),
+            "binding_source": "bootstrap",
+            "binding_strength": "explicit",
+            "bound_at": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
+            "binding_workspace": str(repo_root),
         }
         atomic_write_text(
             sessions_path,
