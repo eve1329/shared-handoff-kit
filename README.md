@@ -144,11 +144,12 @@ AI 先解析出同一个 task-id，再读取该任务的 `process.md` 恢复上�
 
 ### 4. compact 与 controlled clear
 
-- 每次自动 compact 都会写快照并把计数记入 `context_guard.json`。
+- 每次自动 compact 都会写快照并把当前 transcript 的计数记入 task-local `context_guard.json`；不同窗口各自计数。
+- 新窗口 `SessionStart(startup)` 与 `SessionStart(clear)` 都会重置当前会话。恢复另一个 linked worktree 时，bootstrap 读取相同 task、相同 transcript 的最新 guard；旧会话的 count=3 不会阻塞新窗口。
 - 自动 compact 达到阈值（默认 **3 次**）后，下一次实质性工作前会要求一次
   **controlled clear**。
 - 恢复时使用 `codex-auto` 把受保护的 resume 转成带恢复提示词的全新会话，
-  并重置 guard。
+  并由新会话的 startup 重置自己的 guard；旧会话记录保留。会话 guard 只在 resume ID 明确匹配时提前转换，`--last` 等歧义恢复交由 SessionStart 判断。
 
 ### 5. 并行会话
 

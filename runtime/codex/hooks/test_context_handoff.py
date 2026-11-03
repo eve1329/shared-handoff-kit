@@ -14,7 +14,7 @@ import unittest
 import sqlite3
 
 
-SCRIPT = pathlib.Path(__file__).with_name("context_handoff.py")
+SCRIPT = pathlib.Path(os.environ.get("HANDOFF_HOOK_UNDER_TEST") or pathlib.Path(__file__).with_name("context_handoff.py"))
 DEFAULT_TASK_ID = "main"
 
 
@@ -790,6 +790,162 @@ Branch: main
             self.assertEqual(hook_output["hookEventName"], "UserPromptSubmit")
             self.assertIn("Controlled clear is required", hook_output["additionalContext"])
             self.assertIn(".agents/state/tasks/main/context_guard.json", hook_output["additionalContext"])
+
+
+class SessionGuardOwnershipTests(unittest.TestCase):
+    def hook(self, root, transcript, event="UserPromptSubmit", **payload):
+        result = run_hook(root, {"cwd": str(root), "task_id": "main",
+            "transcript_path": str(transcript), "hook_event_name": event, **payload})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads((task_state_dir(root) / "context_guard.json").read_text())
+
+    def pair(self, base):
+        primary, worktree = base / "primary", base / "linked"
+        subprocess.run(["git", "init", "-q", str(primary)], check=True)
+        subprocess.run(["git", "-C", str(primary), "-c", "user.name=Test", "-c", "user.email=test@example.test",
+                        "commit", "--allow-empty", "-qm", "fixture"], check=True)
+        subprocess.run(["git", "-C", str(primary), "worktree", "add", "--detach", "-q", str(worktree)], check=True)
+        return primary, worktree
+
+    def test_fresh_window_restores_old_worktree_without_inheriting_three(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            primary, linked = self.pair(base)
+            old, fresh = base / "old.jsonl", base / "fresh.jsonl"
+            for _ in range(3):
+                self.hook(linked, old, "PostCompact", trigger="auto")
+            semantic = task_state_dir(linked) / "process.md"
+            before = semantic.read_bytes()
+            old_bytes = (task_state_dir(linked) / "context_guard.json").read_bytes()
+            self.hook(primary, fresh, "SessionStart", source="startup")
+            # Reading the status must not mutate or clear the prior session.
+            result = subprocess.run([sys.executable, str(SCRIPT), "--guard-status"],
+                input=json.dumps({"cwd": str(linked), "task_id": "main", "transcript_path": str(fresh)}),
+                text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["auto_compact_count"], 0)
+            self.assertEqual((task_state_dir(linked) / "context_guard.json").read_bytes(), old_bytes)
+            fresh_guard = self.hook(linked, fresh, "TaskRestore")
+            self.assertEqual(fresh_guard["auto_compact_count"], 0)
+            self.assertFalse(fresh_guard["clear_required"])
+            self.assertEqual(fresh_guard["last_reset_source"], "startup")
+            self.assertEqual(semantic.read_bytes(), before)
+            old_guard = self.hook(linked, old, "SessionStart", source="resume")
+            self.assertEqual(old_guard["auto_compact_count"], 3)
+            self.assertTrue(old_guard["clear_required"])
+
+    def test_linked_restore_preserves_actual_compaction_after_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            primary, linked = self.pair(base)
+            transcript = base / "current.jsonl"
+            self.hook(primary, transcript, "SessionStart", source="startup")
+            self.hook(primary, transcript, "PostCompact", trigger="auto")
+            guard = self.hook(linked, transcript, "TaskRestore")
+            self.assertEqual(guard["auto_compact_count"], 1)
+            self.assertFalse(guard["clear_required"])
+            self.assertEqual(guard["last_reset_source"], "startup")
+            self.hook(linked, transcript, "PostCompact", trigger="auto")
+            guard = self.hook(primary, transcript, "TaskRestore")
+            self.assertEqual(guard["auto_compact_count"], 2)
+
+    def test_clear_in_linked_checkout_supersedes_old_primary_budget(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            primary, linked = self.pair(base)
+            transcript = base / "current.jsonl"
+            for _ in range(3):
+                self.hook(primary, transcript, "PostCompact", trigger="auto")
+            self.hook(linked, transcript, "SessionStart", source="clear")
+            guard = self.hook(primary, transcript, "TaskRestore")
+            self.assertEqual(guard["auto_compact_count"], 0)
+            self.assertEqual(guard["last_reset_source"], "clear")
+
+    def test_concurrent_compacts_do_not_lose_increments(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            payload = json.dumps({"cwd": str(root), "task_id": "main", "transcript_path": str(root / "current.jsonl"),
+                                  "hook_event_name": "PostCompact", "trigger": "auto"})
+            workers = [subprocess.Popen([sys.executable, str(SCRIPT)], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
+            for worker in workers:
+                worker.stdin.write(payload)
+                worker.stdin.close()
+            for worker in workers:
+                self.assertEqual(worker.wait(timeout=20), 0, worker.stderr.read())
+                worker.stdout.close()
+                worker.stderr.close()
+            guard = json.loads((task_state_dir(root) / "context_guard.json").read_text())
+            self.assertEqual(guard["auto_compact_count"], 4)
+
+    def test_parallel_sessions_same_task_keep_separate_budgets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            a, b = root / "a.jsonl", root / "b.jsonl"
+            for _ in range(3):
+                self.hook(root, a, "PostCompact", trigger="auto")
+            self.hook(root, b, "SessionStart", source="startup")
+            self.hook(root, b, "PostCompact", trigger="auto")
+            self.assertEqual(self.hook(root, a)["auto_compact_count"], 3)
+            self.assertEqual(self.hook(root, b)["auto_compact_count"], 1)
+
+    def test_clear_resets_only_selected_session_and_resume_compact_preserve(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            a, b = root / "a.jsonl", root / "b.jsonl"
+            for transcript in (a, b):
+                for _ in range(3):
+                    self.hook(root, transcript, "PostCompact", trigger="auto")
+            for source in ("resume", "compact"):
+                self.assertEqual(self.hook(root, a, "SessionStart", source=source)["auto_compact_count"], 3)
+            self.assertEqual(self.hook(root, a, "SessionStart", source="clear")["auto_compact_count"], 0)
+            self.assertEqual(self.hook(root, b)["auto_compact_count"], 3)
+
+    def test_legacy_matching_transcript_migrates_without_reset(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            transcript = root / "old.jsonl"
+            state = task_state_dir(root)
+            state.mkdir(parents=True)
+            (state / "context_guard.json").write_text(json.dumps({"auto_compact_count": 3,
+                "clear_required": True, "last_transcript": str(transcript)}))
+            guard = self.hook(root, transcript, "SessionStart", source="resume")
+            self.assertEqual(guard["auto_compact_count"], 3)
+            self.assertTrue(guard["clear_required"])
+
+    def test_unrelated_repository_does_not_share_task_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            primary, linked = self.pair(base)
+            unrelated = base / "unrelated"
+            unrelated.mkdir()
+            transcript = base / "same.jsonl"
+            for _ in range(3):
+                self.hook(primary, transcript, "PostCompact", trigger="auto")
+            self.assertEqual(self.hook(unrelated, transcript, "TaskRestore")["auto_compact_count"], 0)
+
+    def test_missing_identity_cannot_borrow_another_sessions_blocker(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            for _ in range(3):
+                self.hook(root, root / "old.jsonl", "PostCompact", trigger="auto")
+            result = run_hook(root, {"cwd": str(root), "hook_event_name": "UserPromptSubmit", "prompt": "继续"})
+            context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertNotIn("Controlled clear is required", context)
+            self.assertIn("identity unavailable", context)
+
+    def test_warning_accepts_startup_and_clear_with_session_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            transcript = root / "current.jsonl"
+            for _ in range(3):
+                self.hook(root, transcript, "PostCompact", trigger="auto")
+            result = run_hook(root, {"cwd": str(root), "hook_event_name": "UserPromptSubmit", "prompt": "继续",
+                                     "transcript_path": str(transcript)})
+            context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("SessionStart(startup)", context)
+            self.assertIn("SessionStart(clear)", context)
+            self.assertIn(str(transcript), context)
 
 
 if __name__ == "__main__":

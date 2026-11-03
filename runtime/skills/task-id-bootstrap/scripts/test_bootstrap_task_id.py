@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
 
-SCRIPT = pathlib.Path(__file__).with_name("bootstrap_task_id.py")
+SCRIPT = pathlib.Path(os.environ.get("HANDOFF_BOOTSTRAP_UNDER_TEST") or pathlib.Path(__file__).with_name("bootstrap_task_id.py"))
 
 
 def run_bootstrap(
@@ -44,6 +45,44 @@ def read_session_tasks(repo: pathlib.Path) -> dict:
 
 
 class BootstrapTaskIdTests(unittest.TestCase):
+    def test_bound_restore_uses_exact_session_budget_from_linked_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = pathlib.Path(td)
+            primary, linked, home = base / "primary", base / "linked", base / "codex"
+            subprocess.run(["git", "init", "-q", str(primary)], check=True)
+            subprocess.run(["git", "-C", str(primary), "-c", "user.name=Test", "-c", "user.email=test@example.test",
+                            "commit", "--allow-empty", "-qm", "fixture"], check=True)
+            subprocess.run(["git", "-C", str(primary), "worktree", "add", "--detach", "-q", str(linked)], check=True)
+            runtime_root = pathlib.Path(__file__).resolve().parents[3]
+            portable_hook = runtime_root / "codex/hooks/context_handoff.py"
+            source = pathlib.Path(os.environ.get("HANDOFF_HOOK_UNDER_TEST") or
+                (portable_hook if portable_hook.is_file() else runtime_root / "hooks/context_handoff.py"))
+            (home / "hooks").mkdir(parents=True)
+            for name in ("context_handoff.py", "shared_handoff_lock.py"):
+                shutil.copy2(source.with_name(name), home / "hooks" / name)
+            transcript = base / "fresh.jsonl"
+            transcript.write_text("")
+            guard_path = linked / ".agents/state/tasks/main/context_guard.json"
+            guard_path.parent.mkdir(parents=True)
+            guard_path.write_text(json.dumps({"last_transcript": str(base / "old.jsonl"),
+                "auto_compact_count": 3, "clear_required": True}))
+            hook = home / "hooks/context_handoff.py"
+            for event in ({"hook_event_name": "SessionStart", "source": "startup"},
+                          {"hook_event_name": "PostCompact", "trigger": "auto"}):
+                result = subprocess.run([sys.executable, str(hook)], text=True, capture_output=True,
+                    input=json.dumps({"cwd": str(primary), "task_id": "main", "transcript_path": str(transcript), **event}),
+                    env={**os.environ, "CODEX_HOME": str(home)})
+                self.assertEqual(result.returncode, 0, result.stderr)
+            result = run_bootstrap(linked, "--task-id", "main", "--transcript-path", str(transcript), env={"CODEX_HOME": str(home)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Auto compact count: 1", result.stdout)
+            self.assertIn("Clear required: false", result.stdout)
+            self.assertIn("Last reset: startup", result.stdout)
+            self.assertEqual(json.loads(guard_path.read_text())["auto_compact_count"], 1)
+            auto_text = (guard_path.parent / "process.auto.md").read_text()
+            self.assertIn("Auto Compact Count: 1", auto_text)
+            self.assertIn(str(transcript), auto_text)
+
     def test_existing_root_process_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = pathlib.Path(td)

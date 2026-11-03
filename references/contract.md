@@ -24,8 +24,33 @@ uses them for semantic restoration.
 - `PreCompact` and `PostCompact` to write snapshots and update the compact guard.
 - `Stop` to persist the latest auto snapshot.
 
+## Session ownership and linked worktrees
+
+`context_guard.json` keeps a top-level compatibility snapshot and a `sessions` map
+keyed by normalized transcript path (or explicit thread/session ID when no path
+is available). Semantic task state stays in the selected worktree's `process.md`.
+`SessionStart(startup)` and `SessionStart(clear)` reset only the selected session;
+`resume` and `compact` preserve its count. Another session's threshold cannot
+block this one. Legacy flat guards with a matching transcript retain their budget.
+
+When restoring the same task in a linked Git worktree, the hook reads only that
+task's objective guards across the repository's `git worktree list`, selects the
+newest matching session by `context_updated_at`, and writes locally under a task
+guard lock with atomic replacement. It never synchronizes semantic state or
+resets peer files. Goal metadata updates do not advance the context budget clock.
+
+`task-id-bootstrap` performs a `TaskRestore` through the installed hook's
+`--sync-guard` mode after binding. Its output reports session identity, count,
+clear requirement and reset evidence. `--guard-status` resolves the same evidence
+without writes. Both modes accept hook JSON on stdin. Missing identity is marked
+unverified and does not borrow a foreign session's clear requirement.
+
 `runtime/codex/bin/codex-auto` converts a guarded `resume` into a fresh session with
-an explicit restore prompt, backs up and resets the guard, and supports
+an explicit restore prompt and a guard backup. Session-aware guards require an
+explicit matching resume ID; fresh launches and ambiguous `--last`/picker resumes
+defer to `SessionStart` so another session cannot trigger a forced clear. The
+launcher preserves old session records and lets fresh startup reset the new one.
+Legacy guards without session metadata retain their previous behavior. It supports
 `--auto-task <id>` and `CODEX_TASK_ID=<id>`.
 
 ## Windows Runtime

@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 
 
-SCRIPT = pathlib.Path(__file__).with_name("codex-auto")
+SCRIPT = pathlib.Path(os.environ.get("HANDOFF_LAUNCHER_UNDER_TEST") or pathlib.Path(__file__).with_name("codex-auto"))
 DEFAULT_TASK_ID = "main"
 
 
@@ -69,6 +69,27 @@ def write_guard(
 
 
 class CodexAutoTests(unittest.TestCase):
+    def test_session_guard_does_not_block_fresh_launch_or_different_resume(self):
+        module = load_auto_module()
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            path = write_guard(root)
+            a = "019eb4bd-dbf7-7432-843e-0317ed0639ea"
+            b = "019eb4bd-dbf7-7432-843e-0317ed0639eb"
+            key_a = "transcript:/sessions/rollout-" + a + ".jsonl"
+            key_b = "transcript:/sessions/rollout-" + b + ".jsonl"
+            path.write_text(json.dumps({"session_key": key_a, "clear_required": True,
+                "sessions": {key_a: {"clear_required": True, "auto_compact_count": 3},
+                             key_b: {"clear_required": False, "auto_compact_count": 1}}}))
+            for args in ([], ["继续"], ["app"], ["resume", "--last"], ["resume", b]):
+                self.assertEqual(module.build_plan(args, root, "/tmp/fake-codex")["action"], "passthrough")
+            plan = module.build_plan(["resume", a], root, "/tmp/fake-codex")
+            self.assertEqual(plan["action"], "fresh-session")
+            before = path.read_bytes()
+            applied = module.apply_auto_clear(plan)
+            self.assertTrue(pathlib.Path(applied["guard_backup"]).is_file())
+            self.assertEqual(path.read_bytes(), before)
+
     def test_passthrough_when_clear_not_required(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cwd = pathlib.Path(td)

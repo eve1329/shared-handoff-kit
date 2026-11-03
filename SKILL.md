@@ -39,6 +39,7 @@ controlled clear 规则放在一个可分享目录里。
 - task-id 解析顺序是显式 payload、prompt 中的 `task=<id>`/`task-id=<id>`、当前 session 映射、有效的 `current-task`，最后才是 `main`。
 - 每次有意义的工作后更新当前 task 的 `process.md`；在 `compact`、`clear`、`resume` 或 `/handoff` 前必须包含 Current Task、Done、Key Files、Verification、Current Constraints、Next Step。
 - 自动 compact 达到 guard 的阈值（默认 3 次）后，下一次实质性工作前要求 controlled clear；恢复时先读同一个 task-local `process.md`。
+- compact 计数归属当前 transcript/session；`SessionStart(startup)`（新窗口）与 `SessionStart(clear)` 都重置该会话，`resume`/`compact` 保留计数。不能用另一个会话的旧 guard 要求用户再次 clear。
 - 并行 Claude session 使用 `claude:<session-id>` 映射，不能只依赖共享的 `current-task`。
 
 详细路径和事件映射见 [references/contract.md](references/contract.md)。不要直接编辑
@@ -52,6 +53,17 @@ rollout；运行环境未暴露 transcript 时，只报告 task 文件已初始�
 用户说“继续”“handoff”“新上下文”“compact”时，先解析同一个 task，再读取
 `.agents/state/tasks/<task-id>/process.md`。不要把旧的 root-level
 `.agents/state/process*.md` 当成语义状态。
+
+若启动 checkout 与用户指定的恢复 worktree 不同，在目标 worktree 运行
+`task-id-bootstrap`，核对其输出的 `Guard session`、count、`Clear required` 和
+`Last reset`。hook 仅在同一 Git 仓库的 linked worktree 中查找相同 task、相同
+transcript 的 guard，并使用最新会话记录；它保留旧会话计数，不合并或复制 `process.md`。
+`context_guard.json` 顶层是最近处理会话的快照，`sessions` 保存各会话记录；独立读取顶层
+`count=3` 不能证明当前窗口需要 clear。缺少会话身份时应报告未核验，不冒用旧会话计数。
+
+仅检查时可将含 `cwd`、`task_id`、`transcript_path` 的 hook JSON 通过 stdin 交给
+已安装的 `context_handoff.py --guard-status`；此模式不写状态。正常 task-id 恢复会用
+`--sync-guard` 在目标 task 内保存当前会话快照，不伪造 `SessionStart(clear)` 事件。
 
 ## 运行边界
 

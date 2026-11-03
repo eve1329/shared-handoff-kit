@@ -7,6 +7,7 @@ import datetime as dt
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -182,6 +183,30 @@ def write_if_missing_or_empty(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def sync_session_guard(repo_root: Path, task_id: str, transcript: str) -> None:
+    hook = codex_home() / "hooks" / "context_handoff.py"
+    if not hook.is_file():
+        print("Context guard: NOT VERIFIED (session-aware hook is not installed)")
+        return
+    payload = {"cwd": str(repo_root), "task_id": task_id, "transcript_path": transcript,
+               "hook_event_name": "TaskRestore"}
+    result = subprocess.run([sys.executable, str(hook), "--sync-guard"], input=json.dumps(payload),
+                            text=True, capture_output=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError("session binding succeeded but context guard verification failed")
+    try:
+        guard = json.loads(result.stdout)
+        if not guard.get("session_key"):
+            raise ValueError("no session identity")
+    except (ValueError, AttributeError) as error:
+        raise RuntimeError("session-aware context guard response is invalid") from error
+    print(f"Context guard: {guard['guard_path']}")
+    print(f"Guard session: {guard['session_key']}")
+    print(f"Auto compact count: {guard['auto_compact_count']}")
+    print(f"Clear required: {str(bool(guard['clear_required'])).lower()}")
+    print(f"Last reset: {guard.get('last_reset_source') or 'not observed'} at {guard.get('last_reset_at') or 'not observed'}")
+
+
 def main() -> int:
     args = parse_args()
     repo_root = Path(args.repo).expanduser().resolve()
@@ -222,6 +247,11 @@ def main() -> int:
         else:
             print(f"Session binding: {transcript}")
             print(f"Effective task: {effective_task}")
+            try:
+                sync_session_guard(repo_root, task_id, transcript)
+            except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+                print(f"Context guard: NOT VERIFIED ({error})", file=sys.stderr)
+                return 2
             return 0
 
     message = f"Session binding: NOT BOUND ({resolution_error})"

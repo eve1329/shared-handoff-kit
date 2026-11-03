@@ -93,6 +93,17 @@ Effective task: init-kmp
    - Current Constraints
    - Next Step
 
+   When restoring another checkout, also inspect `Context guard`, `Guard session`,
+   `Auto compact count`, `Clear required` and `Last reset` from bootstrap output.
+   The installed hook resolves this exact transcript across linked worktrees and
+   preserves other sessions' counts. New-window `SessionStart(startup)` and
+   `SessionStart(clear)` are equivalent fresh-context resets; `resume`/`compact`
+   retain the count. Never ask for another clear using a guard owned by another
+   transcript. If output says `Context guard: NOT VERIFIED`, do not claim the
+   current session needs clear or that its guard was reset. Binding alone does
+   not prove guard verification. Do not manually zero a guard or copy process.md
+   between worktrees to resolve a mismatch.
+
 6. Keep task state isolated.
    After a task id is active, read and update only
    `.agents/state/tasks/<task-id>/process.md` and its sibling fallback files.

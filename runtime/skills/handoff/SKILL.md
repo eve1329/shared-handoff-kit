@@ -102,6 +102,14 @@ In a fresh thread, prefer:
 
 If the project has a reset or bootstrap script, run that first.
 
+For shared-handoff-kit tasks, distinguish durable task state from a session's
+compact budget. Run task-id bootstrap in the requested worktree and check the
+exact transcript's guard output before requiring clear. A fresh-window
+`SessionStart(startup)` and `SessionStart(clear)` both reset context; ordinary
+`resume` or `compact` preserves it. Another window's old count is not authority
+for this one. Keep process.md local to the selected worktree rather than merging
+semantic state between checkouts.
+
 ### 2. Reconstruct four things quickly
 
 Before changing code, establish:

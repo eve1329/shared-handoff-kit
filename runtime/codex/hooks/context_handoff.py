@@ -260,10 +260,12 @@ def read_task_goal_thread_id(root: pathlib.Path, task_id: str | None) -> str | N
 
 
 def write_task_goal_thread_id(root: pathlib.Path, task_id: str, goal_thread_id: str) -> pathlib.Path:
-    guard = read_guard(root, task_id)
-    guard["goal_thread_id"] = goal_thread_id
-    guard["goal_last_seen_at"] = now()
-    return write_guard(root, guard, task_id)
+    with exclusive_file_lock(task_guard_path(root, task_id).with_suffix(".json.lock")):
+        guard = read_guard(root, task_id)
+        guard.setdefault("context_updated_at", guard.get("last_updated") or "1970-01-01T00:00:00+00:00")
+        guard["goal_thread_id"] = goal_thread_id
+        guard["goal_last_seen_at"] = now()
+        return write_guard(root, guard, task_id)
 
 
 def resolve_goal_context(root: pathlib.Path, data: dict[str, Any], task_id: str | None) -> dict[str, Any]:
@@ -570,16 +572,87 @@ def write_guard(root: pathlib.Path, guard: dict[str, Any], task_id: str | None =
     path = task_guard_path(root, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     guard["threshold"] = auto_compact_clear_threshold()
-    guard["last_updated"] = now()
-    path.write_text(json.dumps(guard, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    guard["last_updated"] = current_time().isoformat(timespec="microseconds")
+    atomic_write_text(path, json.dumps(guard, ensure_ascii=False, indent=2) + "\n")
     return path
 
 
+def guard_session_key(data: dict[str, Any]) -> str:
+    """A task is durable; the context budget belongs to one exact rollout."""
+    transcript = str(data.get("transcript_path") or data.get("last_transcript") or "")
+    if transcript:
+        return "transcript:" + str(pathlib.Path(transcript).expanduser().resolve())
+    thread = str(data.get("thread_id") or data.get("session_id") or "")
+    return "thread:" + thread if thread else ""
+
+
+def guard_sessions(guard: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    records = guard.get("sessions")
+    sessions = {key: dict(value) for key, value in records.items() if isinstance(value, dict)} if isinstance(records, dict) else {}
+    key = str(guard.get("session_key") or guard_session_key(guard))
+    if key:
+        sessions[key] = {field: value for field, value in guard.items() if field != "sessions"}
+    return sessions
+
+
+def linked_worktree_roots(root: pathlib.Path) -> list[pathlib.Path]:
+    # Read only the same task's objective guard, never another checkout's process.md.
+    listing = run(["git", "worktree", "list", "--porcelain", "-z"], root)
+    return [pathlib.Path(item[9:]).resolve() for item in listing.split("\0") if item.startswith("worktree ")]
+
+
+def guard_timestamp(guard: dict[str, Any]) -> float:
+    try:
+        return _dt.datetime.fromisoformat(str(guard.get("context_updated_at") or guard.get("last_updated") or "")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+
+
+def session_context_guard(root: pathlib.Path, data: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    local = read_guard(root, task_id)
+    key = guard_session_key(data)
+    if not key:
+        if not guard_session_key(local) and not local.get("session_key"):
+            return local  # Compatibility with hook surfaces that supply no session identity.
+        return {**guard_default(), "scope_status": "identity_missing"}
+
+    matches = []
+    for peer in dict.fromkeys([root, *linked_worktree_roots(root)]):
+        candidate = guard_sessions(local if peer == root else read_guard(peer, task_id)).get(key)
+        if candidate:
+            matches.append((candidate, peer))
+    if matches:
+        selected, peer = max(matches, key=lambda pair: guard_timestamp(pair[0]))
+        guard = {**guard_default(), **selected}
+        guard["restored_from"] = str(task_guard_path(peer, task_id))
+        guard["scope_status"] = "matched_session"
+    else:
+        guard = guard_default()
+        guard["scope_status"] = "new_session"
+    guard["session_key"] = key
+    try:
+        guard["auto_compact_count"] = max(0, int(guard.get("auto_compact_count") or 0))
+    except (ValueError, TypeError):
+        guard["auto_compact_count"] = 0
+    guard["clear_required"] = bool(guard.get("clear_required"))
+    guard["threshold"] = auto_compact_clear_threshold()
+    return guard
+
+
 def update_context_guard(root: pathlib.Path, data: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
+    with exclusive_file_lock(task_guard_path(root, task_id).with_suffix(".json.lock")):
+        return update_context_guard_locked(root, data, task_id)
+
+
+def update_context_guard_locked(root: pathlib.Path, data: dict[str, Any], task_id: str | None = None) -> dict[str, Any]:
     event = str(data.get("hook_event_name") or data.get("hookEventName") or "")
     trigger = str(data.get("trigger") or "")
     source = str(data.get("source") or "")
-    guard = read_guard(root, task_id)
+    local = read_guard(root, task_id)
+    sessions = guard_sessions(local)
+    guard = session_context_guard(root, data, task_id)
+    # Goal ownership is task-level and independent of the session's compact budget.
+    guard.update({key: value for key, value in local.items() if key.startswith("goal_")})
 
     guard["last_event"] = event
     guard["last_trigger"] = trigger
@@ -597,6 +670,10 @@ def update_context_guard(root: pathlib.Path, data: dict[str, Any], task_id: str 
         if guard["auto_compact_count"] >= int(guard.get("threshold") or auto_compact_clear_threshold()):
             guard["clear_required"] = True
 
+    guard["context_updated_at"] = current_time().isoformat(timespec="microseconds")
+    if guard.get("session_key"):
+        sessions[guard["session_key"]] = {key: value for key, value in guard.items() if key != "sessions"}
+    guard["sessions"] = sessions
     write_guard(root, guard, task_id)
     return guard
 
@@ -821,6 +898,9 @@ Recent Fallback: {recent_display}
 ## Context Guard
 
 Guard File: {relative(guard_path, root)}
+Guard Session: {guard.get("session_key") or "(identity unavailable)"}
+Guard Scope: {guard.get("scope_status") or "legacy identity unavailable"}
+Guard Restored From: {guard.get("restored_from") or "(local/new session)"}
 Auto Compact Count: {guard.get("auto_compact_count", 0)}
 Auto Compact Clear Threshold: {guard.get("threshold", auto_compact_clear_threshold())}
 Clear Required: {yes_no(bool(guard.get("clear_required")))}
@@ -881,11 +961,23 @@ def context_message(
     process_path: pathlib.Path,
     auto_path: pathlib.Path,
     task_id: str | None = None,
+    guard: dict[str, Any] | None = None,
 ) -> str:
     task_id = effective_task_id(task_id)
     process_rel = relative(process_path, root)
     auto_rel = relative(auto_path, root)
     recent_rel = task_relative_path(RECENT_REL, task_id)
+    guard_context = ""
+    if guard is not None:
+        guard_context = (
+            f"\n- Current guard workspace: `{root}`; session: `{guard.get('session_key') or '(identity unavailable)'}`."
+            f"\n- Current session auto_compact_count={guard.get('auto_compact_count', 0)}; "
+            f"clear_required={yes_no(bool(guard.get('clear_required')))}; "
+            f"last reset={guard.get('last_reset_source') or '(not observed)'} at {guard.get('last_reset_at') or '(not observed)'}."
+            "\n- SessionStart(startup) and SessionStart(clear) both reset a fresh context. "
+            "A different session's count in another checkout is not a reason to clear this session. "
+            "When restoring a different worktree, run task-id bootstrap there to verify the exact-session guard; do not merge process.md files."
+        )
     return (
         "Context handoff protocol is active for this workspace.\n"
         f"- Active task id: `{task_id}`.\n"
@@ -895,6 +987,7 @@ def context_message(
         f"- Keep `{process_rel}` updated with Current Task, Done, Key Files, Verification, "
         "Current Constraints, and Next Step before long-running work, compact, clear, or handoff.\n"
         "- Do not rely on previous chat history after a context switch."
+        + guard_context
     )
 
 
@@ -918,12 +1011,13 @@ def clear_required_message(
     return (
         f"Controlled clear is required for {target}.\n"
         f"- It has reached {count} automatic compactions; threshold is {threshold}.\n"
-        f"- Guard state: `{guard_rel}`.\n"
+        f"- Guard state: `{root / guard_rel}`; session: `{guard.get('session_key') or '(identity unavailable)'}`.\n"
         f"- Before doing substantial new task work, update `{process_rel}` with Current Task, Done, "
         "Key Files, Verification, Current Constraints, and Next Step.\n"
         f"- Use `{auto_rel}` only as objective hook metadata; semantic state belongs in `{process_rel}`.\n"
         "- Then perform a controlled clear/new context step if the surface provides it, or ask the user to run `/clear`.\n"
-        f"- After clear/resume, restore from `{process_rel}` first and verify `{guard_rel}` reset on `SessionStart(clear)`.\n"
+        f"- After a fresh window or clear, restore from `{process_rel}` first and verify the current session reset on `SessionStart(startup)` or `SessionStart(clear)`; both are valid.\n"
+        "- Resume and compact keep the same session budget. Never require another clear using a different session's guard.\n"
         "- Do not continue substantial implementation work in the compressed context unless the user explicitly overrides."
     )
 
@@ -936,6 +1030,19 @@ def json_out(value: dict[str, Any]) -> int:
 
 def main() -> int:
     data = read_input()
+    if "--guard-status" in sys.argv[1:] or "--sync-guard" in sys.argv[1:]:
+        root = workspace_root(session_cwd(data))
+        task_id = resolve_task_id(root, data)
+        if "--sync-guard" in sys.argv[1:]:
+            guard = update_context_guard(root, data, task_id)
+            write_auto_snapshot(root, data, run(["git", "branch", "--show-current"], root),
+                process_health(task_process_path(root, task_id)), task_recent_path(root, task_id),
+                guard, resolve_goal_context(root, data, task_id), task_id)
+        else:
+            guard = session_context_guard(root, data, task_id)
+        return json_out({key: value for key, value in {
+            **guard, "guard_path": str(task_guard_path(root, task_id)), "task_id": task_id,
+        }.items() if key != "sessions"})
     event = str(data.get("hook_event_name") or data.get("hookEventName") or "")
     cwd = session_cwd(data)
     root = workspace_root(cwd)
@@ -956,7 +1063,7 @@ def main() -> int:
     if event == "SessionStart":
         source = str(data.get("source") or "")
         if source in {"startup", "resume", "clear", "compact"}:
-            additional_context = context_message(root, process_path, auto_path, task_id)
+            additional_context = context_message(root, process_path, auto_path, task_id, guard)
             if clear_required_is_effective(guard, goal_active):
                 additional_context = clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
             return json_out(
@@ -972,7 +1079,7 @@ def main() -> int:
     if event == "UserPromptSubmit":
         prompt = str(data.get("prompt") or "")
         if clear_required_is_effective(guard, goal_active) or CONTINUATION_RE.search(prompt):
-            additional_context = context_message(root, process_path, auto_path, task_id)
+            additional_context = context_message(root, process_path, auto_path, task_id, guard)
             if clear_required_is_effective(guard, goal_active):
                 additional_context = clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
             return json_out(

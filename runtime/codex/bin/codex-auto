@@ -340,8 +340,24 @@ def write_json(path: pathlib.Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def clear_required(root: pathlib.Path, task_id: str | None = None) -> bool:
-    return bool(read_json(state_file(root, GUARD_REL, task_id)).get("clear_required"))
+def clear_required(root: pathlib.Path, task_id: str | None = None, args: list[str] | None = None) -> bool:
+    guard = read_json(state_file(root, GUARD_REL, task_id))
+    if guard.get("sessions") or guard.get("session_key") or guard.get("last_transcript"):
+        # A fresh launch has no old budget. For ambiguous --last/picker resumes,
+        # let SessionStart resolve the actual transcript instead of guessing.
+        if command_name(args or []) != "resume":
+            return False
+        targets = [arg for arg in args or [] if re.fullmatch(r"[0-9a-fA-F-]{36}", arg)]
+        if len(targets) != 1:
+            return False
+        target = targets[0]
+        records = dict(guard.get("sessions") or {})
+        key = str(guard.get("session_key") or "transcript:" + str(guard.get("last_transcript") or ""))
+        records[key] = guard
+        matches = [record for identity, record in records.items() if isinstance(record, dict) and
+                   (identity == "thread:" + target or identity.endswith(target + ".jsonl"))]
+        return any(bool(record.get("clear_required")) for record in matches)
+    return bool(guard.get("clear_required"))  # Legacy guard without session metadata.
 
 
 def ensure_process_file(root: pathlib.Path, task_id: str | None = None) -> pathlib.Path:
@@ -394,6 +410,10 @@ def reset_guard(root: pathlib.Path, task_id: str | None = None) -> pathlib.Path 
     if guard_path.exists():
         backup_path = guard_path.with_name(f"context_guard.before-auto-clear.{stamp()}.json")
         backup_path.write_text(guard_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    if guard.get("sessions") or guard.get("session_key") or guard.get("last_transcript"):
+        # Preserve the old session. The new transcript resets on SessionStart(startup).
+        return backup_path
 
     guard.update(
         {
@@ -515,7 +535,7 @@ This file was written by `codex-auto` after the workspace reached the controlled
 - `{process_rel}` - semantic handoff state.
 - `{auto_rel}` - objective hook snapshot.
 - `{recent_rel}` - recent transcript fallback.
-- `{guard_rel}` - controlled-clear guard, reset by this launcher.
+- `{guard_rel}` - session guard; fresh startup resets the new transcript and preserves prior session records. Legacy unscoped guards may be reset by the launcher.
 
 ## Process File
 {process_path}
@@ -558,7 +578,7 @@ def build_plan(args: list[str], cwd: pathlib.Path, codex_bin: str, task_id: str 
     workspace = workspace_root(workspace_from_args(args, cwd))
     task_id = resolve_task_id(workspace, task_id)
     subcommand = command_name(args)
-    requires_clear = clear_required(workspace, task_id)
+    requires_clear = clear_required(workspace, task_id, args)
 
     if not requires_clear:
         return {
