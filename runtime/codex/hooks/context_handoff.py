@@ -316,7 +316,21 @@ def clear_required_is_effective(guard: dict[str, Any], goal_active: bool) -> boo
     return bool(guard.get("clear_required")) and not goal_active
 
 
+def task_selection_text(prompt: str) -> str:
+    text = prompt.strip()
+    if text.startswith("# Files mentioned by the user:"):
+        # Attachment metadata precedes the user's actual request. Parse only
+        # that request, never task-looking filenames or attached image text.
+        marker = re.search(r"(?m)^## My request:[ \t]*\r?$", text)
+        if not marker:
+            return ""
+        text = text[marker.end():].lstrip()
+        text = re.split(r"(?m)^<image\b", text, maxsplit=1)[0]
+    return text.strip()
+
+
 def prompt_task_id(prompt: str) -> str | None:
+    prompt = task_selection_text(prompt)
     if not prompt:
         return None
     match = TASK_ID_PROMPT_RE.search(prompt)
@@ -331,7 +345,7 @@ def prompt_task_id(prompt: str) -> str | None:
 def continuation_task_id(root: pathlib.Path, prompt: str) -> str | None:
     # Only known task names qualify as shorthand; ordinary '继续 debug' and
     # explicit Git branch instructions must not silently create/switch tasks.
-    text = prompt.strip()
+    text = task_selection_text(prompt)
     for pattern in (
         r"^(?:继续|接着|恢复)\s*`?([A-Za-z0-9][A-Za-z0-9._-]{0,79})`?(?=$|[\s，。,:：;；])",
         r"^`?([A-Za-z0-9][A-Za-z0-9._-]{0,79})`?\s*(?:继续|接着)(?=$|[\s，。,:：;；])",

@@ -37,6 +37,8 @@ created directory by itself is only an initialized task.
 
    Existing tasks also accept `继续main`, `main继续` and `继续 epay`.
    A branch instruction such as `继续 main 分支` does not select task `main`.
+   For attachment-wrapped prompts, parse task selection only from `## My request:`;
+   filenames, attachment metadata and image content cannot select a task.
    The Codex hook must persist and inject a verified current-transcript binding
    before task work, including a task-id assignment without a continuation word.
    If a newer receipt disagrees with startup context, use the receipt. An

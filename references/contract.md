@@ -28,7 +28,9 @@ uses them for semantic restoration.
 
 Codex routing also accepts leading shorthand `继续main`, `main继续`, or
 `继续 epay，...` for an existing task (`main` is always available). Explicit
-Git branch commands and unknown shorthand words do not select tasks. An explicit
+Git branch commands and unknown shorthand words do not select tasks. With Codex
+attachment wrappers, task selection uses the `## My request:` body; filenames,
+metadata and appended image content do not select tasks. An explicit
 `task-id=<id>` can create a new task. Each UserPromptSubmit resolves, writes and
 reads back the exact transcript binding under one routing lock, then injects a
 verified receipt before model work, even for regular follow-up prompts. Missing
