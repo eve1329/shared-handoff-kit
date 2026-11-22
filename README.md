@@ -131,6 +131,14 @@ rollout 绑定到 `session-tasks.json`。只有文件创建 + 指针写入 + 会
 Current Constraints / Next Step**。每次有意义的工作后都会更新当前任务的
 `process.md`；compact、clear、resume 或 `/handoff` 前必须写全这六段。
 
+Codex 发现状态缺失、仍是模板或超过45分钟未更新时，普通消息也会要求 AI
+先核对并补写。回合结束仍未补写时，Stop 会要求继续一次完成状态更新；
+`stop_hook_active` 防止无限继续。自动快照不会替代 AI 写入语义状态。
+
+跨 worktree 恢复会列出当前状态的绝对路径，以及同 task 的其他候选路径和
+更新时间。AI 先说明当前使用的位置，不会自动同步或复制其他 worktree 的
+`process.md`。近期记录也支持当前 Codex 的命令、文件修改及自由格式工具事件。
+
 ### 3. 继续 / 交接 / 新线程
 
 ```text

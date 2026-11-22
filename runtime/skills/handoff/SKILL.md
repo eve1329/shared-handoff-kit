@@ -110,6 +110,15 @@ exact transcript's guard output before requiring clear. A fresh-window
 for this one. Keep process.md local to the selected worktree rather than merging
 semantic state between checkouts.
 
+When restoring across worktrees, report the absolute active workspace and
+`process.md` path before implementation. A same-task file in another worktree
+may contain different progress: use hook-reported peer paths/mtimes as location
+hints, never as verified progress or a reason to copy/merge semantic state.
+If the selected state is stale or still a template, read its task-local fallback,
+reconcile current artifacts, and update all six semantic sections before work
+and again after meaningful changes. A Stop repair continuation requests this
+routine update; complete it without asking the user or merely touching mtime.
+
 ### 2. Reconstruct four things quickly
 
 Before changing code, establish:

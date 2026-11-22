@@ -665,6 +665,12 @@ Branch: main
     def test_stop_records_last_assistant_message_without_continuing(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             cwd = pathlib.Path(td)
+            state_dir = task_state_dir(cwd)
+            state_dir.mkdir(parents=True)
+            (state_dir / "process.md").write_text(
+                "# Process State\nUpdated: current\nVerified work complete; next step is tests.\n",
+                encoding="utf-8",
+            )
             result = run_hook(
                 cwd,
                 {

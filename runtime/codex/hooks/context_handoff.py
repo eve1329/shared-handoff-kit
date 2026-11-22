@@ -665,7 +665,7 @@ def guard_sessions(guard: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def linked_worktree_roots(root: pathlib.Path) -> list[pathlib.Path]:
-    # Read only the same task's objective guard, never another checkout's process.md.
+    # Peer semantic contents stay private; callers may inspect paths/mtimes only.
     listing = run(["git", "worktree", "list", "--porcelain", "-z"], root)
     return [pathlib.Path(item[9:]).resolve() for item in listing.split("\0") if item.startswith("worktree ")]
 
@@ -773,11 +773,44 @@ def transcript_event_text(record: dict[str, Any]) -> str:
 
     if record_type == "event_msg":
         payload_type = str(payload.get("type") or "")
-        if payload_type != "agent_message":
+        if payload_type == "agent_message":
+            message = truncate(payload.get("message"), 700)
+            phase = str(payload.get("phase") or "event")
+            return f"- [{timestamp}] assistant/{phase}: {message}"
+        if payload_type != "item_completed" or not isinstance(payload.get("item"), dict):
             return ""
-        message = truncate(payload.get("message"), 700)
-        phase = str(payload.get("phase") or "event")
-        return f"- [{timestamp}] assistant/{phase}: {message}"
+        item = payload["item"]
+        kind = str(item.get("type") or "").replace("_", "").lower()
+        if kind in {"usermessage", "agentmessage"}:
+            role = "user" if kind == "usermessage" else "assistant"
+            message = truncate(extract_content_text(item.get("content")) or item.get("text"), 700)
+            return f"- [{timestamp}] {role}: {message}" if message else ""
+        if kind == "commandexecution":
+            command = item.get("command") or ""
+            if isinstance(command, list):
+                command = " ".join(str(part) for part in command)
+            command = truncate(command, 500)
+            status = item.get("status") or "completed"
+            exit_code = item.get("exit_code", item.get("exitCode"))
+            cwd = item.get("cwd") or "(not supplied)"
+            return f"- [{timestamp}] command ({status}, exit={exit_code}, cwd={cwd}): {command}"
+        if kind == "filechange":
+            changes = item.get("changes")
+            if isinstance(changes, dict):
+                paths = [f"{path} ({change.get('type', 'update') if isinstance(change, dict) else 'update'})"
+                         for path, change in changes.items()]
+            elif isinstance(changes, list):
+                paths = [str(change.get("path") or "") for change in changes if isinstance(change, dict)]
+            else:
+                paths = []
+            # Paths/actions suffice for recovery; do not duplicate complete patches.
+            return f"- [{timestamp}] file changes ({item.get('status') or 'completed'}): {truncate(', '.join(paths), 700)}" if paths else ""
+        if kind == "mcptoolcall":
+            name = ".".join(str(item.get(key) or "") for key in ("server", "tool"))
+            return f"- [{timestamp}] MCP tool `{name}`: {item.get('status') or 'completed'}"
+        if kind == "contextcompaction":
+            return f"- [{timestamp}] context compacted"
+        return ""
 
     if record_type != "response_item":
         return ""
@@ -785,6 +818,8 @@ def transcript_event_text(record: dict[str, Any]) -> str:
     item_type = str(payload.get("type") or "")
     if item_type == "message":
         role = str(payload.get("role") or "message")
+        if role not in {"user", "assistant"}:
+            return ""
         text = truncate(extract_content_text(payload.get("content")), 700)
         return f"- [{timestamp}] {role}: {text}" if text else ""
 
@@ -796,6 +831,18 @@ def transcript_event_text(record: dict[str, Any]) -> str:
     if item_type == "function_call_output":
         call_id = str(payload.get("call_id") or "tool")
         output = truncate(payload.get("output"), 700)
+        return f"- [{timestamp}] tool output `{call_id}`: {output}" if output else ""
+
+    if item_type == "custom_tool_call":
+        name = str(payload.get("name") or "tool")
+        source = str(payload.get("input") or "")
+        paths = re.findall(r"(?m)^\*\*\* (?:Add|Update|Delete) File: (.+)$", source)
+        detail = ": " + truncate(", ".join(paths), 500) if paths else ""
+        return f"- [{timestamp}] custom tool call `{name}`{detail}"
+
+    if item_type == "custom_tool_call_output":
+        call_id = str(payload.get("call_id") or "tool")
+        output = truncate(extract_content_text(payload.get("output")), 700)
         return f"- [{timestamp}] tool output `{call_id}`: {output}" if output else ""
 
     if item_type == "web_search_call":
@@ -822,8 +869,9 @@ def recent_transcript_events(transcript_path: str, limit: int = RECENT_EVENT_LIM
     except OSError:
         return []
 
-    events: deque[str] = deque(maxlen=limit)
-    for line in recent_lines:
+    events: list[str] = []
+    seen_ids: set[str] = set()
+    for line in reversed(recent_lines):
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
@@ -832,8 +880,17 @@ def recent_transcript_events(transcript_path: str, limit: int = RECENT_EVENT_LIM
             continue
         text = transcript_event_text(record)
         if text:
+            payload = record.get("payload", {})
+            item = payload.get("item") if payload.get("type") == "item_completed" else payload
+            identity = str(item.get("id") or "") if isinstance(item, dict) else ""
+            if identity and identity in seen_ids:
+                continue
+            if identity:
+                seen_ids.add(identity)
             events.append(text)
-    return list(events)
+            if len(events) >= limit:
+                break
+    return list(reversed(events))
 
 
 def should_write_recent(data: dict[str, Any], health: dict[str, Any]) -> bool:
@@ -1026,6 +1083,46 @@ def relative(path: pathlib.Path, root: pathlib.Path) -> str:
         return str(path)
 
 
+def state_location_message(root: pathlib.Path, task_id: str) -> str:
+    """Locate same-task state without reading or copying peer semantic files."""
+    active = task_process_path(root, task_id)
+    try:
+        active_mtime = active.stat().st_mtime
+    except OSError:
+        active_mtime = 0.0
+    peers = []
+    for peer in linked_worktree_roots(root):
+        if peer == root:
+            continue
+        candidate = task_process_path(peer, task_id)
+        try:
+            modified = candidate.stat().st_mtime
+        except OSError:
+            continue
+        stamp = _dt.datetime.fromtimestamp(modified).astimezone().isoformat(timespec="seconds")
+        freshness = "newer than active state" if modified > active_mtime else "separate state"
+        peers.append((modified, f"- Same-task peer state: `{candidate}` (mtime {stamp}; {freshness})."))
+    lines = ["Handoff state location (worktree-local):", f"- Active semantic state: `{active}`."]
+    if peers:
+        lines.extend(line for _, line in sorted(peers, reverse=True)[:3])
+        lines.append(
+            "- On a cross-worktree restore, tell the user the active workspace/state path and any newer peer location before implementation. "
+            "The same task id does not make these files interchangeable. Peer paths/mtimes are location hints, not verified progress. "
+            "Restore in the intended worktree; never automatically copy/merge process.md or change the session's task binding."
+        )
+    return "\n".join(lines)
+
+
+def process_repair_message(root: pathlib.Path, task_id: str, health: dict[str, Any]) -> str:
+    return (
+        f"Handoff state needs repair: {health['status']} (age {health['age_minutes']} minutes).\n"
+        f"- Before substantial work, read `{task_process_path(root, task_id)}` and its task-local process.auto.md/process.recent.md.\n"
+        "- Reconcile with current artifacts, then update Current Task, Done, Key Files, Verification, Current Constraints, and Next Step in that process.md. "
+        "Do not merely touch its mtime or copy transcript/peer state. Do not ask the user to perform this routine update.\n"
+        "- Update semantic state again after meaningful changes and before finishing the turn."
+    )
+
+
 def context_message(
     root: pathlib.Path,
     process_path: pathlib.Path,
@@ -1112,7 +1209,8 @@ def binding_message(root: pathlib.Path, data: dict[str, Any], task_id: str, bind
         f"- Read/write semantic state only at `{task_process_path(root, task_id)}`.\n"
         "- This current binding supersedes earlier startup context and the shared current-task pointer. "
         "A Git branch name does not select a task. Keep this binding until the user explicitly selects another task; "
-        "do not claim to switch tasks in prose without verifying the session mapping."
+        "do not claim to switch tasks in prose without verifying the session mapping.\n\n"
+        + state_location_message(root, task_id)
     )
 
 
@@ -1166,6 +1264,8 @@ def main() -> int:
             if clear_required_is_effective(guard, goal_active):
                 additional_context = clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
             additional_context = binding_message(root, data, task_id, binding) + "\n\n" + additional_context
+            if health.get("needs_attention"):
+                additional_context += "\n\n" + process_repair_message(root, task_id, health)
             return json_out(
                 {
                     "hookSpecificOutput": {
@@ -1179,10 +1279,12 @@ def main() -> int:
     if event == "UserPromptSubmit":
         prompt = str(data.get("prompt") or "")
         additional_context = binding_message(root, data, task_id, binding)
-        if clear_required_is_effective(guard, goal_active) or CONTINUATION_RE.search(prompt) or prompt_task_id(prompt) or data.get("task_id") or data.get("taskId"):
+        if health.get("needs_attention") or clear_required_is_effective(guard, goal_active) or CONTINUATION_RE.search(prompt) or prompt_task_id(prompt) or data.get("task_id") or data.get("taskId"):
             additional_context += "\n\n" + context_message(root, process_path, auto_path, task_id, guard)
             if clear_required_is_effective(guard, goal_active):
                 additional_context += "\n\n" + clear_required_message(root, process_path, auto_path, guard, goal_active, task_id)
+        if health.get("needs_attention"):
+            additional_context += "\n\n" + process_repair_message(root, task_id, health)
         return json_out(
             {
                 "hookSpecificOutput": {
@@ -1191,6 +1293,13 @@ def main() -> int:
                 }
             }
         )
+
+    if event == "Stop" and health.get("needs_attention") and not data.get("stop_hook_active"):
+        return json_out({
+            "decision": "block",
+            "reason": process_repair_message(root, task_id, health)
+            + "\nComplete this task-local handoff update, then finish. This is a routine state repair, not a request for user permission.",
+        })
 
     return json_out({})
 

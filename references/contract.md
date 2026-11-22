@@ -24,6 +24,30 @@ uses them for semantic restoration.
 - `PreCompact` and `PostCompact` to write snapshots and update the compact guard.
 - `Stop` to persist the latest auto snapshot.
 
+Codex SessionStart and UserPromptSubmit include the absolute active semantic state
+path. Same-task files in linked worktrees are reported by path and mtime only
+(at most three candidates, newest first); their contents are never imported.
+Before cross-worktree implementation, explain which workspace/state is active
+and where newer peer state exists. A recent peer mtime is a location hint, not
+evidence of completed work, and does not authorize task rebinding or state copying.
+
+Missing/template state or an mtime older than 45 minutes injects a repair
+instruction even for ordinary UserPromptSubmit messages. The agent reconciles
+the selected task's semantic state and fallback with current artifacts, updates
+the six semantic sections, and updates again after meaningful work. Stop returns
+`{"decision":"block","reason":"..."}` if repair remains necessary, asking the
+agent to perform that routine update before finishing. A true `stop_hook_active`
+allows the continued turn to end without a loop; unresolved state remains visible
+on the next user turn. Fresh semantic state lets Stop finish normally. Hooks do
+not synthesize semantic progress or merely touch process.md.
+
+Recent fallback parses legacy response_item messages/function calls, modern
+event_msg/item_completed user/agent messages, command completion (cwd/status/exit),
+file changes (paths/actions), MCP status, and custom_tool_call/output. Duplicate
+item IDs are collapsed. It keeps the most recent 12 usable events from a bounded
+tail of 200 records, excluding reasoning and system/developer messages. Complete
+file diffs and MCP argument/result payloads are not copied into that fallback.
+
 ## Session ownership and linked worktrees
 
 Codex routing also accepts leading shorthand `继续main`, `main继续`, or

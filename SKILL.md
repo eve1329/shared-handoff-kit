@@ -1,6 +1,6 @@
 ---
 name: shared-handoff-kit
-description: Autonomously install or verify a shareable Codex and Claude handoff bundle in the current workspace. Use when an AI receives this package and the user wants the same hook-driven task-local process.md workflow, repeated compaction support, /handoff continuity, or task-id isolation on another machine. Run the bundled activation rather than giving the user shell instructions.
+description: Install, verify, or repair the shared Codex and Claude handoff runtime. Use for task-local process.md continuity, hook or stale-state failures, cross-worktree recovery, repeated compaction, and installing the workflow on another machine. Run activation yourself for installation requests.
 ---
 
 # Shared Handoff Kit
@@ -40,6 +40,9 @@ controlled clear 规则放在一个可分享目录里。
 - Codex 也把已存在任务的 `继续main`、`main继续`、`继续 epay` 当成显式任务选择；`继续 main 分支` 等 Git 操作不切任务。新任务或有歧义的名字使用 `task-id=<id>`。
 - Codex 每次 UserPromptSubmit 都先写入并读回核对当前 transcript 的绑定，再注入 `Task binding: VERIFIED`、任务路径和来源。后续普通消息、compact/resume 和 linked worktree 恢复沿用该会话绑定，不得仅凭 `current-task` 或旧 startup 提示改绑。缺少唯一 transcript 时输出 `NOT VERIFIED`，不能口头宣称已切换。
 - 每次有意义的工作后更新当前 task 的 `process.md`；在 `compact`、`clear`、`resume` 或 `/handoff` 前必须包含 Current Task、Done、Key Files、Verification、Current Constraints、Next Step。
+- Codex 的会话/消息提示明确列出当前 worktree 的状态绝对路径，以及同仓库同 task 的其他候选路径和 mtime；跨 worktree 恢复前先向用户说明实际使用的位置。候选位置只提示路径，不代表已核验的进度，不读取或复制其他 worktree 的语义内容。
+- Codex 检测到 `process.md` 超过45分钟未更新、缺失或仍是模板时，普通消息也注入补写要求。先读取该 task 的状态及 fallback、核对当前文件，再更新六段语义状态。Stop 若仍需补写，返回 `decision=block` 要求 AI 完成一次状态修复；`stop_hook_active` 防止无限继续。不得仅刷新 mtime、复制日志或把补写交给用户。
+- 近期记录支持旧 response_item 消息/函数调用，以及 Codex 的 item_completed 消息、命令、文件变更、MCP状态和 custom_tool_call/output；同ID记录去重，保留有界摘要。文件变更记录路径/动作，不复制完整diff；忽略推理与系统/开发者消息。
 - 自动 compact 达到 guard 的阈值（默认 3 次）后，下一次实质性工作前要求 controlled clear；恢复时先读同一个 task-local `process.md`。
 - compact 计数归属当前 transcript/session；`SessionStart(startup)`（新窗口）与 `SessionStart(clear)` 都重置该会话，`resume`/`compact` 保留计数。不能用另一个会话的旧 guard 要求用户再次 clear。
 - 并行 Claude session 使用 `claude:<session-id>` 映射，不能只依赖共享的 `current-task`。
